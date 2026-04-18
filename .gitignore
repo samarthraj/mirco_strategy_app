@@ -1,0 +1,108 @@
+# ============================================================
+# Build artifacts and dependencies
+# ============================================================
+node_modules
+dist
+dist-ssr
+*.local
+__pycache__
+*.py[cod]
+*.egg-info
+.Python
+.venv
+venv
+
+# ============================================================
+# Logs
+# ============================================================
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ============================================================
+# Editor / IDE / OS
+# ============================================================
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.claude/
+
+# ============================================================
+# Secrets
+# ============================================================
+.env
+.env.local
+.env.*.local
+
+# ============================================================
+# Databases
+# ============================================================
+*.db
+*.sqlite
+*.sqlite3
+
+# ============================================================
+# Raw data — none of this belongs in the repo
+# ============================================================
+# Project data directories (inventory, telemetry, analysis, sql dumps, caches)
+Global Operational/
+Global Insight/
+Global Insight_v2/
+INSIGHT/
+
+# Historical rationalization snapshots
+mstr_rationalization_full/
+mstr_rationalization_go_full_apr07/
+mstr_rationalization_go_full_apr08/
+mstr_rationalization_go_prompted_test/
+mstr_rationalization_insight_prod1/
+mstr_rationalization_*/
+
+# Dashboard static data (emitted JSON consumed by the React UI)
+public/data/
+public/inventory/
+public/projects/
+public/rationalization_report.json
+dist/data/
+
+# UserActivity exports
+UserActivity.csv
+UserActivity_summary.csv
+User Activity.xlsx
+
+# Spreadsheet / tabular dumps anywhere
+*.csv
+*.xlsx
+*.xls
+*.parquet
+
+# Ad-hoc JSON dumps at repo root (extracted SQL, cluster outputs, embeddings caches, etc.)
+extracted_sql_*.json
+cluster_data_for_analysis.json
+*_cache.json
+fetched_paths.json
+fetched_dossier_paths.json
+go_usage_rationalization.json
+inv_report_names.json
+inv_reports_simple.json
+
+# Generated reports / decks / plots
+*.docx
+*.pptx
+*.pdf
+*.png
+*.jpg
+*.jpeg
+
+# Notebooks with embedded data outputs
+*.ipynb
