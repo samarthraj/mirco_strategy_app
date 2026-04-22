@@ -10,12 +10,10 @@ const navigationConfig: Record<string, boolean> = {
   'object-browser': false,
   'data-explorer':  true,
   reports:        false,
-  'report-inventory': true,
   'api-explorer':   false,
   'request-log':    true,
-  'rationalization': true,
   'rationalization-analysis': true,
-  'object-tree':    true,
+  'cross-project': true,
 };
 
 export default navigationConfig;

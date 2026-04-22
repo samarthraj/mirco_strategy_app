@@ -3,9 +3,20 @@ import { VscKey } from 'react-icons/vsc';
 import { login, setBaseUrl as setClientBaseUrl } from '../api/mstrClient';
 import { useApp } from '../context/AppContext';
 
+// Per-environment credential presets. Populated from Vite env vars at build
+// time (defined in .env.local, which is gitignored). If unset, the form stays
+// blank and the user types creds in manually.
+const RL_SBX_URL = 'https://rlanalytics-sbx.ralphlauren.com/MicroStrategyLibrary';
+const ENV_PRESETS: Record<string, { username?: string; password?: string }> = {
+  [RL_SBX_URL]: {
+    username: import.meta.env.VITE_MSTR_USERNAME as string | undefined,
+    password: import.meta.env.VITE_MSTR_PASSWORD as string | undefined,
+  },
+};
+
 const ENVIRONMENTS = [
   { label: 'MicroStrategy Demo', url: 'https://demo.microstrategy.com/MicroStrategyLibrary' },
-  { label: 'Ralph Lauren SBX', url: 'https://rlanalytics-sbx.ralphlauren.com/MicroStrategyLibrary' },
+  { label: 'Ralph Lauren SBX', url: RL_SBX_URL },
 ] as const;
 
 export default function LoginPanel() {
@@ -18,8 +29,9 @@ export default function LoginPanel() {
 
   function handleEnvironmentChange(url: string) {
     setBaseUrl(url);
-    setUsername('');
-    setPassword('');
+    const preset = ENV_PRESETS[url];
+    setUsername(preset?.username || '');
+    setPassword(preset?.password || '');
   }
 
   async function handleLogin(e: React.FormEvent) {

@@ -1123,7 +1123,6 @@ def main():
         f"parent_reports.csv - Parent-child family analysis ({len(all_families):,} families)",
         f"sql/ folder - Extracted SQL for {sql_stats['has_sql']:,} de-duped active reports",
         "analysis/duplicate_sql.json - Duplicate SQL groups with member report details",
-        "rationalization_report.json - Full machine-readable report",
         "inventory/ folder - Raw inventory data by object category (JSON)",
         "analysis/ folder - Detailed analysis outputs",
     ]

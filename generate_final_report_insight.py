@@ -700,7 +700,6 @@ def main():
         f"active_reports_dedup.json — Definition-based family mapping ({dedup_families:,} families)",
         f"active_reports_sql.json — SQL for {has_sql:,} unique active reports",
         "analysis/ folder — Orphans, stale objects, duplicate SQL, unused metrics, high-impact",
-        "rationalization_report.json — Full machine-readable report",
     ]:
         doc.add_paragraph(d, style="List Bullet")
 

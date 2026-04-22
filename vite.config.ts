@@ -65,10 +65,52 @@ function dynamicProxyPlugin() {
           res.end('Proxy error: ' + err.message)
         })
       })
+
+      // Proxy /playground_api/* to the local FastAPI sidecar (see playground_server.py).
+      // This lets the AI Playground tab POST experiment configs directly.
+      const playgroundProxy = httpProxy.createProxyServer({ changeOrigin: true })
+      server.middlewares.use('/playground_api', (req: IncomingMessage, res: ServerResponse) => {
+        req.url = '/playground_api' + (req.url || '')
+        playgroundProxy.web(req, res, { target: 'http://127.0.0.1:8899' }, (err) => {
+          console.error('Playground proxy error:', err.message)
+          res.writeHead(502, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({
+            error: 'Playground sidecar not reachable. Start it with: python playground_server.py',
+            detail: err.message,
+          }))
+        })
+      })
     },
   }
 }
 
 export default defineConfig({
   plugins: [react(), tailwindcss(), dynamicProxyPlugin()],
+  server: {
+    // File-write sources that MUST NOT trigger a full-page reload (it wipes
+    // React auth/state). Vite watches the project root by default — this
+    // includes data.db (SQLite writes on every embedding), emitted JSON,
+    // experiment results, and task-tracking JSON.
+    watch: {
+      ignored: [
+        // SQLite databases — the sidecar writes to semantic_embedding on every
+        // embedding, which otherwise fires Vite HMR → full reload.
+        '**/*.db',
+        '**/*.db-journal',
+        '**/*.db-wal',
+        '**/*.db-shm',
+        '**/*.sqlite',
+        '**/*.sqlite-journal',
+        // Playground outputs (moved out of public/, but covered defensively)
+        '**/data/_playground/**',
+        '**/public/data/_playground/**',
+        // Pipeline-emitted JSON
+        '**/public/data/**/*.json',
+        // Any sidecar/task log output
+        '**/data/**/*.json',
+        // Local scratch
+        '**/*.log',
+      ],
+    },
+  },
 })

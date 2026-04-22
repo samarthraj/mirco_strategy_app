@@ -3,7 +3,7 @@ import type { ReactNode } from 'react';
 import type { RequestLog } from '../api/mstrClient';
 import { onRequestLog, getBaseUrl } from '../api/mstrClient';
 
-export type View = 'login' | 'projects' | 'dashboard' | 'browser' | 'report' | 'cube' | 'explorer' | 'logs' | 'reports' | 'inventory' | 'data-explorer' | 'rationalization' | 'rationalization-analysis' | 'object-tree';
+export type View = 'login' | 'projects' | 'dashboard' | 'browser' | 'report' | 'cube' | 'explorer' | 'logs' | 'reports' | 'data-explorer' | 'rationalization-analysis' | 'cross-project';
 
 interface AppState {
   isAuthenticated: boolean;
@@ -25,12 +25,43 @@ interface AppState {
 
 const AppContext = createContext<AppState | null>(null);
 
+// Storage-backed hook. Uses sessionStorage for auth so a fresh browser launch
+// still shows the login screen, but HMR reloads inside the same tab keep the
+// session alive. Non-auth preferences (selected project, last view) use
+// localStorage so they survive across browser restarts.
+function useStoredState<T>(
+  key: string,
+  initial: T,
+  storage: 'local' | 'session' = 'local',
+): [T, (v: T | ((prev: T) => T)) => void] {
+  const store = storage === 'session' ? window.sessionStorage : window.localStorage;
+  const [v, setV] = useState<T>(() => {
+    try {
+      const raw = store.getItem(key);
+      if (raw != null) return JSON.parse(raw) as T;
+    } catch { /* ignore */ }
+    return initial;
+  });
+  useEffect(() => {
+    try { store.setItem(key, JSON.stringify(v)); } catch { /* ignore */ }
+  }, [key, v, store]);
+  return [v, setV];
+}
+
+// One-time cleanup: earlier versions wrote auth state to localStorage, which
+// meant a fresh browser launch skipped the login screen. Purge those keys so
+// session-scoped storage becomes the single source of truth.
+try {
+  ['app.isAuthenticated', 'app.username', 'app.currentProject', 'app.currentView']
+    .forEach((k) => window.localStorage.removeItem(k));
+} catch { /* ignore */ }
+
 export function AppProvider({ children }: { children: ReactNode }) {
-  const [isAuthenticated, setAuthenticated] = useState(false);
-  const [username, setUsername] = useState('');
+  const [isAuthenticated, setAuthenticated] = useStoredState<boolean>('app.isAuthenticated', false, 'session');
+  const [username, setUsername] = useStoredState<string>('app.username', '', 'session');
   const [baseUrl, setBaseUrl] = useState(getBaseUrl());
-  const [currentProject, setCurrentProject] = useState<{ id: string; name: string } | null>(null);
-  const [currentView, setCurrentView] = useState<View>('login');
+  const [currentProject, setCurrentProject] = useStoredState<{ id: string; name: string } | null>('app.currentProject', null, 'session');
+  const [currentView, setCurrentView] = useStoredState<View>('app.currentView', 'login', 'session');
   const [requestLogs, setRequestLogs] = useState<RequestLog[]>([]);
   const [selectedObjectId, setSelectedObjectId] = useState<string | null>(null);
   const [selectedObjectType, setSelectedObjectType] = useState<number | null>(null);

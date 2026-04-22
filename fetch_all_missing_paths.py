@@ -100,16 +100,30 @@ def main() -> int:
     for s, n in status_need.most_common():
         print(f"  {s}: {n:,}")
 
-    # Cache file — lets us resume after interruption
-    cache_path = project_dir / "inventory" / "fetched_paths.json"
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    fetched_paths = {}
-    if cache_path.exists():
-        fetched_paths = json.loads(cache_path.read_text(encoding="utf-8"))
-        print(f"Resuming: {len(fetched_paths):,} paths already cached")
+    # Canonical output file — also serves as the resume cache.
+    # Shape: [{"id": "...", "path": "..."}]
+    paths_file = project_dir / "inventory" / "paths.json"
+    paths_file.parent.mkdir(parents=True, exist_ok=True)
+    paths_by_id: dict[str, str] = {}
+    if paths_file.exists():
+        try:
+            existing = json.loads(paths_file.read_text(encoding="utf-8"))
+            if isinstance(existing, list):
+                for item in existing:
+                    if isinstance(item, dict) and item.get("id"):
+                        paths_by_id[item["id"]] = item.get("path") or ""
+                print(f"Resuming: {len(paths_by_id):,} paths already in {paths_file.name}")
+        except Exception as e:
+            print(f"  (could not read existing {paths_file.name}: {e})")
+
+    def _save_canonical():
+        payload = [{"id": rid, "path": p} for rid, p in sorted(paths_by_id.items()) if p]
+        paths_file.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    errors_by_id: dict[str, str] = {}
 
     # Filter to what's actually left to fetch
-    to_fetch = [rid for rid in needs_path if rid not in fetched_paths]
+    to_fetch = [rid for rid in needs_path if rid not in paths_by_id]
     print(f"Remaining to fetch: {len(to_fetch):,}")
     if not to_fetch:
         print("Nothing to fetch. Exiting.")
@@ -159,18 +173,18 @@ def main() -> int:
                     raise
 
             if not resp or not resp.ok:
-                fetched_paths[rid] = {"__error": f"HTTP {resp.status_code if resp else 'none'}"}
+                errors_by_id[rid] = f"HTTP {resp.status_code if resp else 'none'}"
                 errors += 1
             else:
                 data = resp.json()
                 path = build_path_from_ancestors(data.get("ancestors", []))
-                fetched_paths[rid] = {"path": path}
                 if path:
+                    paths_by_id[rid] = path
                     ok += 1
                 else:
                     empty += 1
         except Exception as e:
-            fetched_paths[rid] = {"__error": str(e)[:100]}
+            errors_by_id[rid] = str(e)[:100]
             errors += 1
 
         # Progress print + throttle + save
@@ -186,16 +200,20 @@ def main() -> int:
             )
 
         if i % args.save_interval == 0:
-            cache_path.write_text(json.dumps(fetched_paths), encoding="utf-8")
+            _save_canonical()
 
         if args.delay > 0:
             time.sleep(args.delay)
 
     # Final save
-    cache_path.write_text(json.dumps(fetched_paths), encoding="utf-8")
+    _save_canonical()
+    if errors_by_id:
+        err_path = project_dir / "inventory" / "paths_errors.json"
+        err_path.write_text(json.dumps(errors_by_id, indent=2), encoding="utf-8")
+        print(f"Errors logged to: {err_path}")
     print(
         f"\nDone. ok={ok}, empty={empty}, err={errors}"
-        f"\nSaved cache to: {cache_path}"
+        f"\nSaved canonical paths to: {paths_file}"
         f"\n\nNext step: rerun the dashboard build script for this project to"
         f" merge these paths into inventory_all.json / retired.json."
     )

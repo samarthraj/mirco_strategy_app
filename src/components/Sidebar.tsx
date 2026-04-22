@@ -1,4 +1,4 @@
-import { VscServer, VscFolder, VscBeaker, VscOutput, VscSignOut, VscDatabase, VscGraph, VscListTree, VscTable, VscDashboard, VscInspect, VscGraphLine } from 'react-icons/vsc';
+import { VscServer, VscFolder, VscBeaker, VscOutput, VscSignOut, VscDatabase, VscGraph, VscTable, VscDashboard, VscGraphLine, VscGlobe } from 'react-icons/vsc';
 import { useApp } from '../context/AppContext';
 import type { View } from '../context/AppContext';
 import { logout } from '../api/mstrClient';
@@ -10,10 +10,8 @@ const allNavItems: { view: View; configKey: string; icon: typeof VscFolder; labe
   { view: 'browser', configKey: 'object-browser', icon: VscFolder, label: 'Object Browser', requiresProject: true },
   { view: 'data-explorer', configKey: 'data-explorer', icon: VscTable, label: 'Data Explorer', requiresProject: true },
   { view: 'reports', configKey: 'reports', icon: VscGraph, label: 'Reports', requiresProject: true },
-  { view: 'inventory', configKey: 'report-inventory', icon: VscListTree, label: 'Report Inventory', requiresProject: true },
-  { view: 'rationalization', configKey: 'rationalization', icon: VscInspect, label: 'Rationalization', requiresProject: true },
   { view: 'rationalization-analysis', configKey: 'rationalization-analysis', icon: VscGraphLine, label: 'Rationalization Analysis', requiresProject: true },
-  { view: 'object-tree', configKey: 'object-tree', icon: VscListTree, label: 'Object Tree', requiresProject: true },
+  { view: 'cross-project', configKey: 'cross-project', icon: VscGlobe, label: 'Cross-Project' },
   { view: 'explorer', configKey: 'api-explorer', icon: VscBeaker, label: 'API Explorer' },
   { view: 'logs', configKey: 'request-log', icon: VscOutput, label: 'Request Log' },
 ];

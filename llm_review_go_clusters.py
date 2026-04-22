@@ -10,7 +10,8 @@ Uses GPT-5.4 via OpenAI API to classify each cluster:
   - REVIEW_WITH_OWNER (similar but need business confirmation)
   - KEEP_SEPARATE (legitimately different)
 
-After running, re-run build_web_dashboard_data.py to merge into summary.
+After running, re-run `python -m db.compute.build --project global-operational`
+to merge into summary.
 """
 from __future__ import annotations
 import json

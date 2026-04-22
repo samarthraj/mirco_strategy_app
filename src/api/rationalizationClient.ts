@@ -6,7 +6,8 @@ export interface RationalizationSummary {
   projectId: string;
   snapshotDate?: string;
   totalInventory: number;
-  totalObjects: number;
+  totalReportsInventory?: number;
+  totalObjects?: number;
   afterTelemetry: number;
   retired: number;
   afterCollisionCollapse?: number;
@@ -29,9 +30,15 @@ export interface RationalizationSummary {
   afterSqlHash?: number;
   sqlHashSequentialRemovable?: number;
   sqlHashSequentialGroups?: number;
-  afterFamily: number;
-  familyReducible: number;
+  afterFamily?: number;
+  familyReducible?: number;
+  afterPostAstFamily?: number;
+  postAstFamilyCollapsed?: number;
   afterSimilarity: number;
+  afterSemantic?: number;
+  semanticClustersTotal?: number;
+  semanticSingletons?: number;
+  semanticLlmRemovable?: number;
   clustersTotal: number;
   clustersMulti: number;
   clustersSingleton: number;
@@ -87,6 +94,47 @@ export interface ClusterMeta {
   tableCount: number;
   filterCount: number;
   memberIds: string[];
+  isSingletons?: boolean;
+  topExampleName?: string;
+  dataQuality?: 'high' | 'mixed' | 'low' | 'unknown';
+  dataQualityReason?: 'ok' | 'empty_features' | 'sparse_features' | 'mixed_features' | 'no_members';
+  emptyMemberCount?: number;
+}
+
+export interface SemanticClusterLlm {
+  label: string;
+  businessFunction: string;
+  relationship: string;
+  action: string;
+  confidence: string;
+  detail: string;
+  keepReport: string;
+  removableCount: number;
+  error?: string | null;
+}
+
+export interface SemanticClusterMember {
+  id: string;
+  cosineToPrimary: number | null;
+}
+
+export interface SemanticCluster {
+  id: string;
+  size: number;
+  primaryReportId: string;
+  primaryName: string;
+  totalExecutions: number;
+  totalUsers: number;
+  avgCosine: number | null;
+  minCosine: number | null;
+  members: SemanticClusterMember[];
+  memberIds: string[];
+  isSingletons?: boolean;
+  topExampleName?: string;
+  llm?: SemanticClusterLlm;
+  dataQuality?: 'high' | 'mixed' | 'low' | 'unknown';
+  dataQualityReason?: 'ok' | 'empty_features' | 'sparse_features' | 'mixed_features' | 'no_members';
+  emptyMemberCount?: number;
 }
 
 export interface ReportDetail {
@@ -101,15 +149,31 @@ export interface ReportDetail {
   metrics: string[];
   tables: string[];
   filters: string[];
+  attributes?: string[];
   metricCount: number;
   tableCount: number;
   filterCount: number;
+  attributeCount?: number;
   clusterId: string | null;
   familyBase: string;
   dateCreated: string | null;
   dateModified: string | null;
   sql?: string | null;
   sqlError?: string | null;
+  sourceType?: string | null;
+  status?: string | null;
+  isFinalCanonical?: boolean;
+  /** If this report is a family canonical, the collapsed siblings it stands
+   *  for. Empty otherwise. */
+  familySiblings?: FamilyCollapsedSibling[];
+}
+
+export interface FamilyCollapsedSibling {
+  id: string;
+  name: string;
+  suffix: string;
+  status: string;
+  executions: number;
 }
 
 export interface PairSimilarity {
@@ -217,6 +281,366 @@ export async function fetchClusters(projectName: string): Promise<ClusterMeta[]>
   return res.json();
 }
 
+export interface PlaygroundExperimentIndexEntry {
+  id: string;
+  name: string;
+  project: string;
+  createdAt: string;
+  stats: {
+    inputReports: number;
+    reportsEmbedded: number;
+    edges: number;
+    multiClusters: number;
+    singletons: number;
+    finalUnique: number;
+  };
+  config: {
+    scope: string;
+    sourceFilter: string;
+    model: string;
+    dim: number;
+    threshold: number;
+    minClusterSize: number;
+    fields: Record<string, boolean | number>;
+  };
+}
+
+export interface PlaygroundVizPoint {
+  id: string;
+  x: number;
+  y: number;
+  clusterId: string | null;
+  name: string;
+  executions: number;
+}
+
+export interface PlaygroundViz {
+  scatter: PlaygroundVizPoint[];
+  topPairs: Array<[string, string, number]>; // [rid_a, rid_b, cosine]
+  thresholdUsed: number;
+}
+
+export interface PlaygroundExperiment {
+  id: string;
+  name: string;
+  config: Record<string, unknown>;
+  createdAt: string;
+  stats: PlaygroundExperimentIndexEntry['stats'];
+  clusters: Array<{
+    id: string;
+    size: number;
+    primaryReportId: string;
+    primaryName: string;
+    totalExecutions: number;
+    avgCosine: number | null;
+    minCosine: number | null;
+    memberIds: string[];
+  }>;
+  singletonIds: string[];
+  viz?: PlaygroundViz;
+}
+
+// Playground data lives OUTSIDE public/ — Vite's file watcher would
+// full-page-reload the UI whenever an experiment wrote a file there and
+// kick the user back to the login screen. The sidecar is the only source.
+export async function fetchPlaygroundIndex(): Promise<PlaygroundExperimentIndexEntry[]> {
+  try {
+    const res = await fetch("/playground_api/index");
+    if (!res.ok) return [];
+    return res.json();
+  } catch {
+    return [];
+  }
+}
+
+export async function fetchPlaygroundExperiment(id: string): Promise<PlaygroundExperiment | null> {
+  try {
+    const res = await fetch(`/playground_api/exp/${encodeURIComponent(id)}`);
+    if (!res.ok) return null;
+    return res.json();
+  } catch {
+    return null;
+  }
+}
+
+export interface PlaygroundTask {
+  id: string;
+  status: "running" | "completed" | "failed" | "interrupted";
+  name: string;
+  expId: string | null;
+  config: Record<string, unknown>;
+  startedAt: string;
+  endedAt: string | null;
+  error: string | null;
+}
+
+async function _unwrapError(res: Response): Promise<never> {
+  let detail = `HTTP ${res.status}`;
+  try {
+    const err = await res.json();
+    detail = err.detail || err.error || detail;
+  } catch { /* non-JSON */ }
+  throw new Error(detail);
+}
+
+/** Kick off an experiment asynchronously. Returns the task descriptor. Poll
+ *  fetchPlaygroundTask(task.id) until status !== 'running'. */
+export async function runPlaygroundExperiment(config: Record<string, unknown>): Promise<PlaygroundTask> {
+  const res = await fetch("/playground_api/run", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(config),
+  });
+  if (!res.ok) await _unwrapError(res);
+  return res.json();
+}
+
+/** Kick off a business-domain classification. Same task contract as run. */
+export async function runDomainClassification(config: Record<string, unknown>): Promise<PlaygroundTask> {
+  const res = await fetch("/playground_api/domains/run", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(config),
+  });
+  if (!res.ok) await _unwrapError(res);
+  return res.json();
+}
+
+export interface DensityDefaults {
+  umap_n_neighbors: number;
+  umap_min_dist: number;
+  umap_n_components: number;
+  hdbscan_min_cluster_size: number;
+  hdbscan_min_samples: number;
+  hdbscan_cluster_selection_method: string;
+}
+
+/** Kick off UMAP + HDBSCAN density clustering. Same task contract as run. */
+export async function runDensityClustering(config: Record<string, unknown>): Promise<PlaygroundTask> {
+  const res = await fetch("/playground_api/density/run", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(config),
+  });
+  if (!res.ok) await _unwrapError(res);
+  return res.json();
+}
+
+export async function fetchDensityDefaults(): Promise<DensityDefaults | null> {
+  try {
+    const res = await fetch("/playground_api/density/defaults");
+    if (!res.ok) return null;
+    return res.json();
+  } catch {
+    return null;
+  }
+}
+
+/** Default fixed taxonomy exposed by the sidecar. */
+export async function fetchDomainTaxonomy(): Promise<string[]> {
+  try {
+    const res = await fetch("/playground_api/domains/taxonomy");
+    if (!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data.domains) ? data.domains : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function fetchPlaygroundTask(id: string): Promise<PlaygroundTask | null> {
+  try {
+    const res = await fetch(`/playground_api/task/${encodeURIComponent(id)}`);
+    if (res.status === 404) return null;
+    if (!res.ok) await _unwrapError(res);
+    return res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchPlaygroundTasks(): Promise<PlaygroundTask[]> {
+  try {
+    const res = await fetch("/playground_api/tasks");
+    if (!res.ok) return [];
+    return res.json();
+  } catch {
+    return [];
+  }
+}
+
+export async function checkPlaygroundHealth(): Promise<{ ok: boolean; openai_key_set: boolean } | null> {
+  try {
+    const res = await fetch("/playground_api/health");
+    if (!res.ok) return null;
+    return res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function deletePlaygroundExperiment(id: string): Promise<void> {
+  await fetch(`/playground_api/exp/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+export interface ActiveExperimentInfo {
+  project: string;
+  expId: string | null;
+  name?: string;
+  createdAt?: string;
+  stats?: {
+    inputReports?: number;
+    reportsEmbedded?: number;
+    edges?: number;
+    multiClusters?: number;
+    singletons?: number;
+    finalUnique?: number;
+  };
+}
+
+/** Which playground experiment (if any) is promoted as "primary" for a project.
+ *  When set, the Semantic Clusters tab loads this experiment instead of the
+ *  static pipeline-emitted file. */
+export async function fetchActiveExperiment(project: string): Promise<ActiveExperimentInfo> {
+  try {
+    const res = await fetch(`/playground_api/active/${encodeURIComponent(project)}`);
+    if (!res.ok) return { project, expId: null };
+    return res.json();
+  } catch {
+    return { project, expId: null };
+  }
+}
+
+export async function setActiveExperiment(project: string, expId: string): Promise<ActiveExperimentInfo> {
+  const res = await fetch(`/playground_api/active/${encodeURIComponent(project)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ expId }),
+  });
+  if (!res.ok) await _unwrapError(res);
+  return res.json();
+}
+
+export async function clearActiveExperiment(project: string): Promise<void> {
+  await fetch(`/playground_api/active/${encodeURIComponent(project)}`, { method: "DELETE" });
+}
+
+/** Fetch the active experiment's clusters transformed into SemanticCluster
+ *  shape. Returns null if there's no active experiment set. */
+export async function fetchActiveExperimentSemanticClusters(project: string): Promise<SemanticCluster[] | null> {
+  try {
+    const res = await fetch(`/playground_api/active/${encodeURIComponent(project)}/semantic_clusters`);
+    if (res.status === 404) return null;
+    if (!res.ok) return null;
+    return res.json();
+  } catch {
+    return null;
+  }
+}
+
+export interface AiChatMessage {
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+}
+
+export async function askAssistant(project: string, messages: AiChatMessage[]): Promise<{ answer: string; model: string; usage: unknown }> {
+  const res = await fetch("/playground_api/assistant/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ project, messages }),
+  });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const err = await res.json();
+      detail = err.detail || err.error || detail;
+    } catch { /* non-JSON */ }
+    throw new Error(detail);
+  }
+  return res.json();
+}
+
+export async function fetchSemanticClusters(projectName: string): Promise<SemanticCluster[]> {
+  const res = await fetch(dataUrl(projectName, "semantic_clusters.json"));
+  if (!res.ok) {
+    if (res.status === 404) return [];
+    throw new Error(`Failed to load semantic clusters: ${res.status}`);
+  }
+  return res.json();
+}
+
+export type ClusterComparisonCategory = 'both' | 'jaccardOnly' | 'semanticOnly' | 'neither';
+
+export interface ClusterComparisonReport {
+  id: string;
+  name: string;
+  path: string;
+  owner: string;
+  executions: number;
+  hasSql: boolean;
+  category: ClusterComparisonCategory;
+  jaccardClusterId: string | null;
+  jaccardClusterSize: number | null;
+  semanticClusterId: string | null;
+  semanticClusterSize: number | null;
+  semanticLabel: string | null;
+}
+
+export interface ClusterComparison {
+  postAstTotal: number;
+  stats: {
+    both: number;
+    jaccardOnly: number;
+    semanticOnly: number;
+    neither: number;
+  };
+  reports: ClusterComparisonReport[];
+}
+
+export async function fetchClusterComparison(projectName: string): Promise<ClusterComparison | null> {
+  const res = await fetch(dataUrl(projectName, "cluster_comparison.json"));
+  if (!res.ok) {
+    if (res.status === 404) return null;
+    throw new Error(`Failed to load cluster comparison: ${res.status}`);
+  }
+  return res.json();
+}
+
+export interface HeavyUserReport {
+  objectId: string;
+  reportName: string;
+  executions: number;
+  sessions: number;
+  errors: number;
+  lastExec: string;
+  folderPath: string;
+  inInventory: boolean;
+  status: string | null;
+  clusterId: string | null;
+  isFinalCanonical: boolean;
+  inventoryName: string | null;
+}
+
+export interface HeavyUser {
+  user: string;
+  isService: boolean;
+  totalExecutions: number;
+  uniqueReports: number;
+  sessions: number;
+  errors: number;
+  lastExec: string;
+  topReports: HeavyUserReport[];
+}
+
+export async function fetchHeavyUsers(projectName: string): Promise<HeavyUser[]> {
+  const res = await fetch(dataUrl(projectName, "heavy_users.json"));
+  if (!res.ok) {
+    if (res.status === 404) return [];
+    throw new Error(`Failed to load heavy users: ${res.status}`);
+  }
+  return res.json();
+}
+
 export async function fetchReports(projectName: string): Promise<ReportDetail[]> {
   const res = await fetch(dataUrl(projectName, "reports.json"));
   if (!res.ok) throw new Error(`Failed to load reports: ${res.status}`);
@@ -275,6 +699,7 @@ export interface SlimReport {
   path: string;
   dateCreated: string | null;
   dateModified: string | null;
+  sourceType?: string | null;
 }
 
 export interface InventoryRecord extends SlimReport {

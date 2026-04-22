@@ -12,6 +12,7 @@ interface Props {
 }
 
 export default function ReportComparison({ reportA, reportB, similarity, onClose }: Props) {
+  const attributesDiff = computeSetDiff(reportA.attributes || [], reportB.attributes || []);
   const metricsDiff = computeSetDiff(reportA.metrics, reportB.metrics);
   const tablesDiff = computeSetDiff(reportA.tables, reportB.tables);
   const filtersDiff = computeSetDiff(reportA.filters, reportB.filters);
@@ -23,11 +24,19 @@ export default function ReportComparison({ reportA, reportB, similarity, onClose
           100
       );
 
+  const attributeScore = (attributesDiff.similarity * 100).toFixed(0);
   const metricScore = (metricsDiff.similarity * 100).toFixed(0);
   const tableScore = (tablesDiff.similarity * 100).toFixed(0);
   const filterScore = (filtersDiff.similarity * 100).toFixed(0);
 
+  const hasAttrs = (reportA.attributes?.length ?? 0) > 0 || (reportB.attributes?.length ?? 0) > 0;
+
   const reasons: string[] = [];
+  if (hasAttrs && attributesDiff.similarity === 1)
+    reasons.push(`100% attribute overlap (${attributesDiff.shared.length} shared — same dimensional grain)`);
+  else if (hasAttrs && attributesDiff.similarity >= 0.75)
+    reasons.push(`${attributeScore}% attribute overlap (${attributesDiff.shared.length} shared)`);
+
   if (metricsDiff.similarity === 1 && reportA.metrics.length > 0)
     reasons.push(`100% metric overlap (${metricsDiff.shared.length} shared)`);
   else if (metricsDiff.similarity >= 0.75 && reportA.metrics.length > 0)
@@ -128,6 +137,19 @@ export default function ReportComparison({ reportA, reportB, similarity, onClose
             <ReportHeader report={reportB} label="Report B" borderLeft />
           </div>
 
+          {/* Attributes Diff — template dimensions (GROUP BY columns). Shown
+              first because this is the dimensional grain of the report. */}
+          {hasAttrs && (
+            <DiffSection
+              title="Attributes"
+              scoreLabel={`${attributeScore}% match`}
+              scoreColor={attributesDiff.similarity >= 0.9 ? 'green' : attributesDiff.similarity >= 0.7 ? 'yellow' : 'orange'}
+              shared={attributesDiff.shared}
+              onlyA={attributesDiff.onlyA}
+              onlyB={attributesDiff.onlyB}
+            />
+          )}
+
           {/* Metrics Diff */}
           <DiffSection
             title="Metrics"
@@ -191,6 +213,12 @@ function ReportHeader({
         <div className="flex gap-4 pt-1">
           <span><span className="text-gray-500">Executions:</span> <span className="text-white font-mono">{report.executions.toLocaleString()}</span></span>
           <span><span className="text-gray-500">Users:</span> <span className="text-white font-mono">{report.users}</span></span>
+        </div>
+        <div className="flex gap-3 pt-0.5 font-mono text-[11px]">
+          <span title="Attributes"><span className="text-gray-500">A:</span> <span className="text-amber-300">{report.attributeCount ?? (report.attributes?.length ?? 0)}</span></span>
+          <span title="Metrics"><span className="text-gray-500">M:</span> <span className="text-blue-300">{report.metricCount}</span></span>
+          <span title="Tables"><span className="text-gray-500">T:</span> <span className="text-emerald-300">{report.tableCount}</span></span>
+          <span title="Filters"><span className="text-gray-500">F:</span> <span className="text-purple-300">{report.filterCount}</span></span>
         </div>
         <div><span className="text-gray-500">Last Exec:</span> {report.lastExec || '-'}</div>
       </div>

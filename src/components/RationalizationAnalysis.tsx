@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
   PieChart, Pie, Legend,
@@ -8,16 +8,42 @@ import {
   fetchSummary, fetchClusters, fetchReports, fetchSimilarities, fetchFamilies,
   fetchFingerprints, fetchSqlHashGroups, fetchAstClusters, fetchAstHashes,
   fetchCollisions, fetchInventoryAll, fetchRetired, fetchLlmReviews, getPairSimilarity,
-  astJaccard,
+  astJaccard, fetchSemanticClusters, fetchHeavyUsers, fetchClusterComparison,
+  fetchPlaygroundIndex, fetchPlaygroundExperiment, runPlaygroundExperiment,
+  checkPlaygroundHealth, deletePlaygroundExperiment,
+  fetchPlaygroundTask, askAssistant,
+  fetchActiveExperiment, setActiveExperiment, clearActiveExperiment,
+  fetchActiveExperimentSemanticClusters,
+  runDomainClassification,
+  runDensityClustering, fetchDensityDefaults,
 } from '../api/rationalizationClient';
 import type {
   RationalizationSummary, ClusterMeta, ReportDetail, PairSimilarity, Family,
   FingerprintGroup, SqlHashGroup, AstCluster, CollisionGroup, LlmReview,
+  SemanticCluster, HeavyUser, ClusterComparison, ClusterComparisonCategory,
+  PlaygroundExperimentIndexEntry, PlaygroundExperiment, PlaygroundTask,
+  PlaygroundVizPoint, ActiveExperimentInfo,
+  FamilyCollapsedSibling,
 } from '../api/rationalizationClient';
+
+// localStorage-backed state — survives tab switches AND page reloads.
+function usePersistentState<T>(key: string, initial: T): [T, (v: T | ((prev: T) => T)) => void] {
+  const [value, setValue] = useState<T>(() => {
+    try {
+      const raw = window.localStorage.getItem(key);
+      if (raw != null) return JSON.parse(raw) as T;
+    } catch { /* ignore */ }
+    return initial;
+  });
+  useEffect(() => {
+    try { window.localStorage.setItem(key, JSON.stringify(value)); } catch { /* quota */ }
+  }, [key, value]);
+  return [value, setValue];
+}
 import ReportComparison from './ReportComparison';
 import { useApp } from '../context/AppContext';
 
-type TabKey = 'overview' | 'methodology' | 'phases' | 'collisions' | 'fingerprints' | 'sqlhash' | 'ast' | 'families' | 'clusters' | 'llm-review' | 'reports' | 'summary';
+type TabKey = 'overview' | 'methodology' | 'phases' | 'collisions' | 'fingerprints' | 'sqlhash' | 'ast' | 'families' | 'clusters' | 'semantic' | 'comparison' | 'ai-playground' | 'density' | 'llm-review' | 'reports' | 'heavy-users' | 'summary';
 
 interface SlimListRow {
   id: string;
@@ -34,6 +60,7 @@ interface SlimListRow {
   filterCount: number | null;
   status: 'active' | 'retired' | 'collapsed';
   bucket?: 'original' | 'new' | 'added';
+  sourceType?: string | null;
 }
 
 const TAB_LABELS: Record<TabKey, string> = {
@@ -45,9 +72,14 @@ const TAB_LABELS: Record<TabKey, string> = {
   sqlhash: 'SQL Hash',
   ast: 'AST',
   families: 'Families',
-  clusters: 'Clusters',
+  clusters: 'Jaccard Clusters',
+  semantic: 'Semantic Clusters',
+  comparison: 'Jaccard vs Semantic',
+  'ai-playground': 'AI Playground',
+  density: 'Density Clustering',
   'llm-review': 'LLM Review',
-  reports: 'Reports',
+  reports: 'Final Reports to Keep',
+  'heavy-users': 'Heavy Users',
   summary: 'Summary',
 };
 
@@ -79,6 +111,21 @@ export default function RationalizationAnalysis() {
   const [llmSearch, setLlmSearch] = useState('');
   const [llmActionFilter, setLlmActionFilter] = useState<'all' | string>('all');
   const [selectedLlmReview, setSelectedLlmReview] = useState<LlmReview | null>(null);
+  const [semanticClusters, setSemanticClusters] = useState<SemanticCluster[]>([]);
+  // If a Playground experiment is promoted as "primary" for this project, the
+  // Semantic Clusters tab loads its data instead of the static pipeline file.
+  const [activeExpInfo, setActiveExpInfo] = useState<ActiveExperimentInfo | null>(null);
+  const [semanticSearch, setSemanticSearch] = useState('');
+  const [semanticActionFilter, setSemanticActionFilter] = useState<'all' | string>('all');
+  const [selectedSemantic, setSelectedSemantic] = useState<SemanticCluster | null>(null);
+  const [selectedReport, setSelectedReport] = useState<ReportDetail | null>(null);
+  const [clusterComparison, setClusterComparison] = useState<ClusterComparison | null>(null);
+  const [comparisonCategory, setComparisonCategory] = useState<'all' | ClusterComparisonCategory>('all');
+  const [comparisonSearch, setComparisonSearch] = useState('');
+  const [heavyUsers, setHeavyUsers] = useState<HeavyUser[]>([]);
+  const [heavyUserSearch, setHeavyUserSearch] = useState('');
+  const [heavyUserShowService, setHeavyUserShowService] = useState(false);
+  const [selectedHeavyUser, setSelectedHeavyUser] = useState<HeavyUser | null>(null);
   const [reportListModal, setReportListModal] = useState<
     null | { title: string; kind: 'inventory' | 'retired' | 'active' }
   >(null);
@@ -97,6 +144,8 @@ export default function RationalizationAnalysis() {
   const [reportSearch, setReportSearch] = useState('');
   const [reportSort, setReportSort] = useState<'executions' | 'name' | 'users'>('executions');
   const [reportPathFilter, setReportPathFilter] = useState<'all' | 'public' | 'personal'>('all');
+  const [reportSourceFilter, setReportSourceFilter] = useState<'all' | 'normal' | 'cube' | 'custom_sql_free_form' | 'none'>('all');
+  const [reportScope, setReportScope] = useState<'final' | 'all'>('final');
 
   useEffect(() => {
     let cancelled = false;
@@ -131,8 +180,14 @@ export default function RationalizationAnalysis() {
       fetchAstHashes(projectName).catch(() => ({} as Record<string, string[]>)),
       fetchCollisions(projectName).catch(() => [] as CollisionGroup[]),
       fetchLlmReviews(projectName).catch(() => [] as LlmReview[]),
+      fetchSemanticClusters(projectName).catch(() => [] as SemanticCluster[]),
+      fetchHeavyUsers(projectName).catch(() => [] as HeavyUser[]),
+      fetchClusterComparison(projectName).catch(() => null as ClusterComparison | null),
+      // Active experiment (Playground promotion) — if one is set for this
+      // project, we'll swap its clusters in below, replacing `sem`.
+      fetchActiveExperiment(projectName).catch(() => ({ project: '', expId: null } as ActiveExperimentInfo)),
     ])
-      .then(([s, c, r, sim, fams, fps, sqlh, asts, astH, cols, llm]) => {
+      .then(async ([s, c, r, sim, fams, fps, sqlh, asts, astH, cols, llm, sem, hu, cmp, active]) => {
         if (cancelled) return;
         setSummary(s);
         setClusters(c);
@@ -145,6 +200,20 @@ export default function RationalizationAnalysis() {
         setAstHashes(astH);
         setCollisions(cols);
         setLlmReviews(llm);
+        setHeavyUsers(hu);
+        setClusterComparison(cmp);
+
+        if (active && active.expId) {
+          // Replace pipeline's semantic clusters with the active experiment's
+          const expSem = await fetchActiveExperimentSemanticClusters(projectName).catch(() => null);
+          if (!cancelled) {
+            setActiveExpInfo(active);
+            setSemanticClusters(expSem ?? sem);
+          }
+        } else {
+          setActiveExpInfo(null);
+          setSemanticClusters(sem);
+        }
         setLoading(false);
       })
       .catch((err) => {
@@ -157,6 +226,42 @@ export default function RationalizationAnalysis() {
       cancelled = true;
     };
   }, [projectName]);
+
+  // Called by the Playground tab when the user promotes/clears a "primary"
+  // experiment. Re-fetches the active info + semantic clusters (either the
+  // experiment's or the pipeline's) so the Semantic Clusters tab reflects
+  // the change without a full project reload.
+  async function reloadSemanticFromActive() {
+    if (!projectName) return;
+    try {
+      const active = await fetchActiveExperiment(projectName);
+      if (active && active.expId) {
+        const expSem = await fetchActiveExperimentSemanticClusters(projectName);
+        setActiveExpInfo(active);
+        if (expSem) setSemanticClusters(expSem);
+      } else {
+        const sem = await fetchSemanticClusters(projectName).catch(() => [] as SemanticCluster[]);
+        setActiveExpInfo(null);
+        setSemanticClusters(sem);
+      }
+    } catch { /* ignore */ }
+  }
+
+  // Effective summary — when an experiment is promoted as primary, overlay its
+  // semantic counts onto the pipeline's summary so the Overview/Phases and any
+  // other consumers reflect the experiment's reduction instead of the pipeline's.
+  const effectiveSummary = useMemo<RationalizationSummary | null>(() => {
+    if (!summary) return null;
+    if (!activeExpInfo?.expId) return summary;
+    const multi = semanticClusters.filter((c) => !c.isSingletons);
+    const sing = semanticClusters.find((c) => c.isSingletons);
+    const finalUnique = multi.length + (sing?.size ?? 0);
+    return {
+      ...summary,
+      semanticClustersTotal: multi.length,
+      afterSemantic: finalUnique,
+    };
+  }, [summary, activeExpInfo, semanticClusters]);
 
   const reportById = useMemo(() => {
     const map = new Map<string, ReportDetail>();
@@ -254,9 +359,23 @@ export default function RationalizationAnalysis() {
     );
   }, [sqlHashGroups, sqlHashSearch]);
 
+  const finalKeptReports = useMemo(
+    () => reports.filter((r) => r.isFinalCanonical === true),
+    [reports]
+  );
+
   const filteredReports = useMemo(() => {
     const q = reportSearch.toLowerCase().trim();
-    let list = reports;
+    // Scope: final = only final-kept; all = everything in reports.json
+    let list = reportScope === 'final' ? finalKeptReports : reports;
+    // Source-type filter
+    if (reportSourceFilter !== 'all') {
+      list = list.filter((r) => {
+        const src = (r.sourceType || '').trim();
+        if (reportSourceFilter === 'none') return src === '';
+        return src === reportSourceFilter;
+      });
+    }
     if (q) {
       list = list.filter(
         (r) =>
@@ -277,8 +396,9 @@ export default function RationalizationAnalysis() {
       if (reportSort === 'users') return b.users - a.users;
       return b.executions - a.executions;
     });
-    return list.slice(0, 500);
-  }, [reports, reportSearch, reportSort, reportPathFilter]);
+    return list.slice(0, 2000);
+  }, [finalKeptReports, reports, reportScope, reportSourceFilter,
+      reportSearch, reportSort, reportPathFilter]);
 
   function handleOpenCluster(cluster: ClusterMeta) {
     setSelectedCluster(cluster);
@@ -306,23 +426,26 @@ export default function RationalizationAnalysis() {
     setReportListLoading(true);
     try {
       if (kind === 'active') {
-        // For "Active Reports" we use the 994 canonical reports
+        // For "Active Reports" we use the active canonical reports from reports.json
         setReportListData(
-          reports.map((r) => ({
-            id: r.id,
-            name: r.name,
-            owner: r.owner,
-            path: r.path,
-            dateCreated: r.dateCreated ?? null,
-            dateModified: r.dateModified ?? null,
-            executions: r.executions,
-            users: r.users,
-            lastExec: r.lastExec,
-            metricCount: r.metricCount,
-            tableCount: r.tableCount,
-            filterCount: r.filterCount,
-            status: 'active',
-          }))
+          reports
+            .filter((r) => (r.status || 'active') === 'active')
+            .map((r) => ({
+              id: r.id,
+              name: r.name,
+              owner: r.owner,
+              path: r.path,
+              dateCreated: r.dateCreated ?? null,
+              dateModified: r.dateModified ?? null,
+              executions: r.executions,
+              users: r.users,
+              lastExec: r.lastExec,
+              metricCount: r.metricCount,
+              tableCount: r.tableCount,
+              filterCount: r.filterCount,
+              status: 'active',
+              sourceType: r.sourceType ?? null,
+            }))
         );
       } else if (kind === 'retired') {
         const data = await fetchRetired(projectName);
@@ -342,6 +465,7 @@ export default function RationalizationAnalysis() {
             filterCount: null,
             status: 'retired',
             bucket: r.bucket,
+            sourceType: r.sourceType ?? null,
           }))
         );
       } else {
@@ -361,6 +485,7 @@ export default function RationalizationAnalysis() {
             tableCount: null,
             filterCount: null,
             status: r.status,
+            sourceType: r.sourceType ?? null,
           }))
         );
       }
@@ -398,7 +523,7 @@ export default function RationalizationAnalysis() {
           <div className="text-red-400 text-xl mb-2">Failed to load</div>
           <div className="text-sm">{error || 'Unknown error'}</div>
           <div className="text-xs mt-4 text-gray-600">
-            Run <code className="bg-[#16213e] px-2 py-1 rounded">python build_web_dashboard_data.py</code> to generate data files
+            Run <code className="bg-[#16213e] px-2 py-1 rounded">python -m db.compute.build --project all</code> to generate data files
           </div>
         </div>
       </div>
@@ -442,9 +567,9 @@ export default function RationalizationAnalysis() {
 
       {/* Tab Content */}
       <div className="p-6">
-        {activeTab === 'overview' && <OverviewTab summary={summary} onKpiClick={handleOpenKpiList} />}
+        {activeTab === 'overview' && <OverviewTab summary={effectiveSummary!} onKpiClick={handleOpenKpiList} />}
         {activeTab === 'methodology' && <MethodologyTab />}
-        {activeTab === 'phases' && <PhasesTab summary={summary} />}
+        {activeTab === 'phases' && <PhasesTab summary={effectiveSummary!} />}
         {activeTab === 'collisions' && (
           <CollisionsTab
             collisions={filteredCollisions}
@@ -453,7 +578,7 @@ export default function RationalizationAnalysis() {
             setSearch={setCollisionSearch}
             passFilter={collisionPassFilter}
             setPassFilter={setCollisionPassFilter}
-            summary={summary}
+            summary={effectiveSummary!}
             onOpen={setSelectedCollision}
           />
         )}
@@ -463,7 +588,7 @@ export default function RationalizationAnalysis() {
             totalCount={fingerprints.length}
             search={fingerprintSearch}
             setSearch={setFingerprintSearch}
-            summary={summary}
+            summary={effectiveSummary!}
             onOpen={setSelectedFingerprint}
           />
         )}
@@ -473,7 +598,7 @@ export default function RationalizationAnalysis() {
             totalCount={sqlHashGroups.length}
             search={sqlHashSearch}
             setSearch={setSqlHashSearch}
-            summary={summary}
+            summary={effectiveSummary!}
             onOpen={setSelectedSqlHash}
           />
         )}
@@ -486,7 +611,7 @@ export default function RationalizationAnalysis() {
             setSearch={setAstSearch}
             showExclusiveOnly={astShowExclusiveOnly}
             setShowExclusiveOnly={setAstShowExclusiveOnly}
-            summary={summary}
+            summary={effectiveSummary!}
             onOpen={setSelectedAstCluster}
           />
         )}
@@ -496,6 +621,7 @@ export default function RationalizationAnalysis() {
             totalCount={families.length}
             search={familySearch}
             setSearch={setFamilySearch}
+            summary={effectiveSummary!}
             onOpen={setSelectedFamily}
           />
         )}
@@ -504,7 +630,28 @@ export default function RationalizationAnalysis() {
             clusters={filteredClusters}
             search={clusterSearch}
             setSearch={setClusterSearch}
+            summary={effectiveSummary!}
+            reportById={reportById}
             onOpen={handleOpenCluster}
+          />
+        )}
+        {activeTab === 'semantic' && (
+          <SemanticTab
+            clusters={semanticClusters}
+            search={semanticSearch}
+            setSearch={setSemanticSearch}
+            actionFilter={semanticActionFilter}
+            setActionFilter={setSemanticActionFilter}
+            summary={effectiveSummary!}
+            reportById={reportById}
+            onOpen={setSelectedSemantic}
+            activeExpInfo={activeExpInfo}
+            onClearActive={async () => {
+              if (!projectName) return;
+              await clearActiveExperiment(projectName);
+              await reloadSemanticFromActive();
+            }}
+            onGoToPlayground={() => setActiveTab('ai-playground')}
           />
         )}
         {activeTab === 'llm-review' && (
@@ -515,25 +662,70 @@ export default function RationalizationAnalysis() {
             setSearch={setLlmSearch}
             actionFilter={llmActionFilter}
             setActionFilter={setLlmActionFilter}
-            summary={summary}
+            summary={effectiveSummary!}
+            semanticClusters={semanticClusters}
             onOpen={setSelectedLlmReview}
           />
         )}
         {activeTab === 'reports' && (
           <ReportsTab
             reports={filteredReports}
-            totalCount={reports.length}
+            totalCount={reportScope === 'final' ? finalKeptReports.length : reports.length}
+            allReports={reports}
+            finalKeptCount={finalKeptReports.length}
             search={reportSearch}
             setSearch={setReportSearch}
             sort={reportSort}
             setSort={setReportSort}
             pathFilter={reportPathFilter}
             setPathFilter={setReportPathFilter}
+            sourceFilter={reportSourceFilter}
+            setSourceFilter={setReportSourceFilter}
+            scope={reportScope}
+            setScope={setReportScope}
             clusters={clusters}
             onOpenCluster={handleOpenCluster}
+            onOpenReport={setSelectedReport}
+            projectId={currentProject?.id || ''}
+            projectName={projectName}
           />
         )}
-        {activeTab === 'summary' && <SummaryTab summary={summary} />}
+        {activeTab === 'comparison' && (
+          <ClusterComparisonTab
+            data={clusterComparison}
+            category={comparisonCategory}
+            setCategory={setComparisonCategory}
+            search={comparisonSearch}
+            setSearch={setComparisonSearch}
+          />
+        )}
+        {activeTab === 'ai-playground' && (
+          <AiPlaygroundTab
+            projectId={currentProject?.id || ''}
+            projectName={projectName}
+            reportById={reportById}
+            onActiveChanged={reloadSemanticFromActive}
+          />
+        )}
+        {activeTab === 'density' && (
+          <DensityClusteringTab
+            projectId={currentProject?.id || ''}
+            projectName={projectName}
+            reportById={reportById}
+            onActiveChanged={reloadSemanticFromActive}
+          />
+        )}
+        {activeTab === 'heavy-users' && (
+          <HeavyUsersTab
+            users={heavyUsers}
+            search={heavyUserSearch}
+            setSearch={setHeavyUserSearch}
+            showService={heavyUserShowService}
+            setShowService={setHeavyUserShowService}
+            onOpen={setSelectedHeavyUser}
+          />
+        )}
+        {activeTab === 'summary' && <SummaryTab summary={effectiveSummary!} />}
       </div>
 
       {/* Cluster drill-down modal */}
@@ -543,6 +735,37 @@ export default function RationalizationAnalysis() {
           reportById={reportById}
           onClose={() => setSelectedCluster(null)}
           onCompare={handleCompareReports}
+        />
+      )}
+
+      {/* Semantic cluster drill-down modal */}
+      {selectedSemantic && (
+        <SemanticClusterModal
+          cluster={selectedSemantic}
+          reportById={reportById}
+          onClose={() => setSelectedSemantic(null)}
+          onCompare={handleCompareReports}
+        />
+      )}
+
+      {/* Heavy user drill-down modal */}
+      {selectedHeavyUser && (
+        <HeavyUserModal
+          user={selectedHeavyUser}
+          onClose={() => setSelectedHeavyUser(null)}
+        />
+      )}
+
+      {/* Report detail modal (Final Reports to Keep drill-down) */}
+      {selectedReport && (
+        <ReportDetailModal
+          report={selectedReport}
+          clusters={clusters}
+          onClose={() => setSelectedReport(null)}
+          onOpenCluster={(c) => {
+            setSelectedReport(null);
+            handleOpenCluster(c);
+          }}
         />
       )}
 
@@ -686,11 +909,11 @@ function OverviewTab({
     border: string;
     clickKind?: 'inventory' | 'retired' | 'active';
   }[] = [
-    { label: 'Original Inventory', value: summary.totalInventory, color: 'text-white', border: 'border-blue-500', clickKind: 'inventory' },
+    { label: 'Original Reports Inventory', value: summary.totalReportsInventory ?? summary.totalInventory, color: 'text-white', border: 'border-blue-500', clickKind: 'inventory' },
     { label: 'Retired (No Usage)', value: summary.retired, color: 'text-orange-400', border: 'border-orange-500', clickKind: 'retired' },
     { label: 'Active Reports', value: summary.afterTelemetry, color: 'text-white', border: 'border-blue-500', clickKind: 'active' },
-    { label: 'Similarity Clusters', value: summary.clustersTotal, color: 'text-white', border: 'border-blue-500' },
-    { label: 'Final Unique', value: summary.afterSimilarity, color: 'text-green-400', border: 'border-green-500' },
+    { label: 'Semantic Clusters', value: summary.semanticClustersTotal ?? summary.clustersTotal, color: 'text-white', border: 'border-teal-500' },
+    { label: 'Final Unique (Semantic)', value: summary.afterSemantic ?? summary.afterSimilarity, color: 'text-green-400', border: 'border-green-500' },
     { label: 'Total Reduction', value: `${summary.reductionPct}%`, color: 'text-green-400', border: 'border-green-500' },
   ];
 
@@ -752,8 +975,9 @@ function OverviewTab({
               data={[
                 { name: 'Telemetry Retired', value: summary.retired, fill: '#e67e22' },
                 { name: 'Fingerprint Dedup', value: summary.afterTelemetry - (summary.afterFingerprint ?? summary.afterTelemetry), fill: '#9b59b6' },
-                { name: 'Similarity Cluster', value: (summary.afterFingerprint ?? summary.afterTelemetry) - summary.afterSimilarity, fill: '#16a085' },
-                { name: 'Final Unique', value: summary.afterSimilarity, fill: '#27ae60' },
+                { name: 'Family Collapse', value: (summary.afterAst ?? summary.afterFingerprint ?? summary.afterTelemetry) - (summary.afterFamily ?? summary.afterPostAstFamily ?? summary.afterAst ?? summary.afterFingerprint ?? summary.afterTelemetry), fill: '#f39c12' },
+                { name: 'Semantic Cluster', value: (summary.afterFamily ?? summary.afterPostAstFamily ?? summary.afterAst ?? summary.afterTelemetry) - (summary.afterSemantic ?? summary.afterSimilarity), fill: '#16a085' },
+                { name: 'Final Unique', value: summary.afterSemantic ?? summary.afterSimilarity, fill: '#27ae60' },
               ]}
             >
               <XAxis dataKey="name" tick={{ fill: '#8895a7', fontSize: 11 }} />
@@ -920,8 +1144,8 @@ function MethodologyTab() {
       color: 'green',
     },
     {
-      title: 'Similarity Clustering (Weighted Jaccard)',
-      body: 'For every pair of surviving canonicals, compute a weighted Jaccard similarity. Pairs with SQL get: 0.60 AST + 0.25 metrics + 0.15 tables. Pairs without SQL get: 0.40 metrics + 0.40 tables + 0.20 filter attributes. Pairs ≥ 0.80 are linked; connected components form clusters. Each multi-member cluster represents reports that do essentially the same query with parameter-level differences.',
+      title: 'Jaccard Clustering (Weighted)',
+      body: 'Lexical set-overlap clustering on post-AST canonicals. For every pair compute a weighted Jaccard: pairs with SQL get 0.60 AST + 0.25 metrics + 0.15 tables; pairs without SQL get 0.40 metrics + 0.40 tables + 0.20 filter attributes. Pairs ≥ 0.80 are linked; connected components form clusters. Catches reports doing essentially the same query with parameter-level differences. Complementary to Semantic Clustering (which runs on the same input via vector embeddings and catches synonym/terminology drift this one misses).',
       color: 'purple',
     },
     {
@@ -1285,6 +1509,7 @@ function FingerprintModal({
               <tr>
                 <th className="text-left p-2 text-xs text-gray-400 uppercase w-8"></th>
                 <th className="text-left p-2 text-xs text-gray-400 uppercase">Name</th>
+                <th className="text-left p-2 text-xs text-gray-400 uppercase w-16">Source</th>
                 <th className="text-left p-2 text-xs text-gray-400 uppercase">Path</th>
                 <th className="text-right p-2 text-xs text-gray-400 uppercase">Execs</th>
                 <th className="text-right p-2 text-xs text-gray-400 uppercase">Users</th>
@@ -1294,6 +1519,7 @@ function FingerprintModal({
             <tbody>
               {group.members.map((m, i) => {
                 const isSelected = selectedForCompare.includes(m.id);
+                const rd = reportById.get(m.id);
                 return (
                   <tr
                     key={m.id}
@@ -1309,6 +1535,7 @@ function FingerprintModal({
                       {m.name}
                       {i === 0 && <span className="text-xs text-green-400 ml-2">(primary)</span>}
                     </td>
+                    <td className="p-2"><SourceTypePill sourceType={rd?.sourceType} /></td>
                     <td className="p-2 text-gray-500 text-xs truncate max-w-xs" title={m.path}>{m.path}</td>
                     <td className="p-2 text-right font-mono text-gray-300">{m.executions.toLocaleString()}</td>
                     <td className="p-2 text-right font-mono text-gray-300">{m.users}</td>
@@ -1655,6 +1882,7 @@ function AstClusterModal({
               <tr>
                 <th className="text-left p-2 text-xs text-gray-400 uppercase w-8"></th>
                 <th className="text-left p-2 text-xs text-gray-400 uppercase">Name</th>
+                <th className="text-left p-2 text-xs text-gray-400 uppercase w-16">Source</th>
                 <th className="text-left p-2 text-xs text-gray-400 uppercase">Path</th>
                 <th className="text-right p-2 text-xs text-gray-400 uppercase">Execs</th>
                 <th className="text-right p-2 text-xs text-gray-400 uppercase">Users</th>
@@ -1664,6 +1892,7 @@ function AstClusterModal({
             <tbody>
               {cluster.members.map((m, i) => {
                 const isSelected = selectedForCompare.includes(m.id);
+                const rd = reportById.get(m.id);
                 return (
                   <tr
                     key={m.id}
@@ -1679,6 +1908,7 @@ function AstClusterModal({
                       {m.name}
                       {i === 0 && <span className="text-xs text-green-400 ml-2">(primary)</span>}
                     </td>
+                    <td className="p-2"><SourceTypePill sourceType={rd?.sourceType} /></td>
                     <td className="p-2 text-gray-500 text-xs truncate max-w-xs" title={m.path}>{m.path}</td>
                     <td className="p-2 text-right font-mono text-gray-300">{m.executions.toLocaleString()}</td>
                     <td className="p-2 text-right font-mono text-gray-300">{m.users}</td>
@@ -1699,12 +1929,14 @@ function FamiliesTab({
   totalCount,
   search,
   setSearch,
+  summary,
   onOpen,
 }: {
   families: Family[];
   totalCount: number;
   search: string;
   setSearch: (v: string) => void;
+  summary: RationalizationSummary | null;
   onOpen: (f: Family) => void;
 }) {
   const totalReducible = families.reduce((s, f) => s + f.reducible, 0);
@@ -1712,6 +1944,86 @@ function FamiliesTab({
 
   return (
     <div className="space-y-4">
+      {/* Pipeline lineage banner — Families runs on post-AST survivors and
+          IS the reduction stage that feeds clustering. */}
+      {summary && (
+        <div className="bg-gradient-to-r from-purple-950/60 to-[#16213e] p-4 rounded-lg border border-purple-800/40">
+          <div className="text-xs uppercase tracking-wider text-purple-300 font-bold mb-2">Pipeline Lineage</div>
+          <div className="flex items-center gap-2 text-sm flex-wrap">
+            <span className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]">
+              <span className="text-gray-400">Inventory:</span>{' '}
+              <span className="font-bold text-white">{summary.totalInventory.toLocaleString()}</span>
+            </span>
+            <span className="text-gray-500">{'\u2192'}</span>
+            <span className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]">
+              <span className="text-gray-400">After telemetry:</span>{' '}
+              <span className="font-bold text-white">{summary.afterTelemetry.toLocaleString()}</span>
+              <span className="text-red-400 text-xs ml-1">({'\u2212'}{summary.retired.toLocaleString()})</span>
+            </span>
+            {summary.afterCollisionCollapse !== undefined && (
+              <>
+                <span className="text-gray-500">{'\u2192'}</span>
+                <span className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]">
+                  <span className="text-gray-400">Collision:</span>{' '}
+                  <span className="font-bold text-white">{summary.afterCollisionCollapse.toLocaleString()}</span>
+                </span>
+              </>
+            )}
+            <span className="text-gray-500">{'\u2192'}</span>
+            <span className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]">
+              <span className="text-gray-400">Fingerprint:</span>{' '}
+              <span className="font-bold text-white">{summary.afterFingerprint?.toLocaleString() ?? '-'}</span>
+            </span>
+            {summary.afterSqlHash !== undefined && (
+              <>
+                <span className="text-gray-500">{'\u2192'}</span>
+                <span className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]">
+                  <span className="text-blue-300">SQL Hash:</span>{' '}
+                  <span className="font-bold text-white">{summary.afterSqlHash.toLocaleString()}</span>
+                </span>
+              </>
+            )}
+            {summary.afterAst !== undefined && (
+              <>
+                <span className="text-gray-500">{'\u2192'}</span>
+                <span
+                  className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]"
+                  title="Post-AST canonical set — the input to the Family stage."
+                >
+                  <span className="text-pink-300">After AST (Family input):</span>{' '}
+                  <span className="font-bold text-white">{summary.afterAst.toLocaleString()}</span>
+                </span>
+              </>
+            )}
+            <span className="text-gray-500">{'\u2192'}</span>
+            <span
+              className="px-3 py-1.5 bg-purple-900/40 rounded border border-purple-700 ring-2 ring-purple-500/40"
+              title="Post-AST survivors grouped by name pattern; each multi-member family elects a canonical (highest-executions). Non-canonicals drop out. Output feeds Similarity + Semantic clustering."
+            >
+              <span className="text-purple-300">After Family:</span>{' '}
+              <span className="font-bold text-white">{(summary.afterFamily ?? summary.afterPostAstFamily ?? summary.afterAst)?.toLocaleString() ?? '-'}</span>
+              {(summary.familyReducible ?? summary.postAstFamilyCollapsed ?? 0) > 0 && (
+                <span className="text-green-400 text-xs ml-1">
+                  ({'\u2212'}{(summary.familyReducible ?? summary.postAstFamilyCollapsed)?.toLocaleString()})
+                </span>
+              )}
+            </span>
+            <span className="text-gray-500">{'\u2192'}</span>
+            <span className="text-gray-500">feeds Similarity + Semantic</span>
+          </div>
+
+          <p className="text-xs text-gray-500 mt-3 leading-relaxed">
+            Families runs on the <strong className="text-pink-300">{summary.afterAst?.toLocaleString() ?? '?'}</strong> post-AST
+            canonicals. Each multi-member family (same name root, different suffixes like{' '}
+            <code className="text-gray-400 bg-[#0f0f1a] px-1 rounded">_ACC</code> /{' '}
+            <code className="text-gray-400 bg-[#0f0f1a] px-1 rounded">_MENS</code>) elects the highest-exec member as the
+            canonical; the {(summary.familyReducible ?? summary.postAstFamilyCollapsed ?? 0).toLocaleString()} non-canonical
+            siblings are dropped from the clustering input. The {totalCount.toLocaleString()} family groups below show the
+            elected canonical (✓) and the variant suffixes that got collapsed.
+          </p>
+        </div>
+      )}
+
       {/* Explainer panel */}
       <div className="bg-[#16213e] p-5 rounded-lg border-l-4 border-purple-500">
         <h3 className="text-white font-bold mb-2">How Family Dedup Works</h3>
@@ -1805,17 +2117,219 @@ function ClustersTab({
   clusters,
   search,
   setSearch,
+  summary,
+  reportById,
   onOpen,
 }: {
   clusters: ClusterMeta[];
   search: string;
   setSearch: (v: string) => void;
+  summary: RationalizationSummary | null;
+  reportById: Map<string, ReportDetail>;
   onOpen: (c: ClusterMeta) => void;
 }) {
+  // Reducible = (size - 1) per MULTI-member cluster only. The singletons
+  // bucket (isSingletons=true) holds N unrelated reports where each already
+  // survives — no reduction there. Including it here caused the lineage
+  // banner to display "(−4,722)" against "After Similarity: 3,404" which is
+  // numerically impossible.
+  const clusterReducible = clusters
+    .filter((c) => !c.isSingletons)
+    .reduce((s, c) => s + Math.max(0, c.size - 1), 0);
+  const sqlCountByCluster = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const c of clusters) {
+      let n = 0;
+      for (const id of c.memberIds) {
+        if (reportById.get(id)?.sql) n++;
+      }
+      m.set(c.id, n);
+    }
+    return m;
+  }, [clusters, reportById]);
   return (
-    <div className="bg-[#16213e] p-6 rounded-lg">
+    <div className="space-y-4">
+      {summary && (
+        <div className="bg-gradient-to-r from-teal-950/60 to-[#16213e] p-4 rounded-lg border border-teal-800/40">
+          <div className="text-xs uppercase tracking-wider text-teal-300 font-bold mb-2">Pipeline Lineage</div>
+          <div className="flex items-center gap-2 text-sm flex-wrap">
+            <span className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]">
+              <span className="text-gray-400">Inventory:</span>{' '}
+              <span className="font-bold text-white">{summary.totalInventory.toLocaleString()}</span>
+            </span>
+            <span className="text-gray-500">{'\u2192'}</span>
+            <span className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]">
+              <span className="text-gray-400">After telemetry:</span>{' '}
+              <span className="font-bold text-white">{summary.afterTelemetry.toLocaleString()}</span>
+              <span className="text-red-400 text-xs ml-1">({'\u2212'}{summary.retired.toLocaleString()})</span>
+            </span>
+            {summary.afterCollisionCollapse !== undefined && summary.collisionCollapsed !== undefined && summary.collisionCollapsed > 0 && (
+              <>
+                <span className="text-gray-500">{'\u2192'}</span>
+                <span
+                  className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]"
+                  title="Same telemetry row attributed to multiple MSTR objects by the fuzzy matcher — collapsed to one canonical object per row"
+                >
+                  <span className="text-gray-400">After collision collapse:</span>{' '}
+                  <span className="font-bold text-white">{summary.afterCollisionCollapse.toLocaleString()}</span>
+                  <span className="text-amber-400 text-xs ml-1">({'\u2212'}{summary.collisionCollapsed.toLocaleString()})</span>
+                </span>
+              </>
+            )}
+            <span className="text-gray-500">{'\u2192'}</span>
+            <span className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]">
+              <span className="text-gray-400">After Fingerprint:</span>{' '}
+              <span className="font-bold text-white">{summary.afterFingerprint?.toLocaleString() ?? '-'}</span>
+              {summary.fingerprintRemovable !== undefined && (
+                <span className="text-green-400 text-xs ml-1">({'\u2212'}{summary.fingerprintRemovable.toLocaleString()})</span>
+              )}
+            </span>
+            {summary.afterSqlHash !== undefined && (
+              <>
+                <span className="text-gray-500">{'\u2192'}</span>
+                <span
+                  className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]"
+                  title="Merge fingerprint canonicals whose normalized SQL hash is byte-identical"
+                >
+                  <span className="text-blue-300">After SQL Hash:</span>{' '}
+                  <span className="font-bold text-white">{summary.afterSqlHash.toLocaleString()}</span>
+                  {summary.sqlHashSequentialRemovable !== undefined && summary.sqlHashSequentialRemovable > 0 ? (
+                    <span className="text-green-400 text-xs ml-1">({'\u2212'}{summary.sqlHashSequentialRemovable.toLocaleString()})</span>
+                  ) : (
+                    <span className="text-gray-500 text-xs ml-1">(0 new)</span>
+                  )}
+                </span>
+              </>
+            )}
+            {summary.afterAst !== undefined && (
+              <>
+                <span className="text-gray-500">{'\u2192'}</span>
+                <span
+                  className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]"
+                  title="AST-based structural dedup — canonical subtree hashes merged ≥ 0.80"
+                >
+                  <span className="text-pink-300">After AST:</span>{' '}
+                  <span className="font-bold text-white">{summary.afterAst.toLocaleString()}</span>
+                  {summary.astSequentialRemovable !== undefined && summary.astSequentialRemovable > 0 ? (
+                    <span className="text-green-400 text-xs ml-1">({'\u2212'}{summary.astSequentialRemovable.toLocaleString()})</span>
+                  ) : (
+                    <span className="text-gray-500 text-xs ml-1">(0 new)</span>
+                  )}
+                </span>
+              </>
+            )}
+            {summary.afterPostAstFamily !== undefined && (
+              <>
+                <span className="text-gray-500">{'\u2192'}</span>
+                <span
+                  className="px-3 py-1.5 bg-orange-900/20 rounded border border-orange-700/50"
+                  title="Post-AST Family collapse — name-sibling canonicals collapsed to 1 per family. Input to Similarity + Semantic."
+                >
+                  <span className="text-orange-300">After Family:</span>{' '}
+                  <span className="font-bold text-white">{summary.afterPostAstFamily.toLocaleString()}</span>
+                  {summary.postAstFamilyCollapsed !== undefined && summary.postAstFamilyCollapsed > 0 && (
+                    <span className="text-green-400 text-xs ml-1">({'\u2212'}{summary.postAstFamilyCollapsed.toLocaleString()})</span>
+                  )}
+                </span>
+              </>
+            )}
+            <span className="text-gray-500">{'\u2192'}</span>
+            <span
+              className="px-3 py-1.5 bg-teal-900/40 rounded border border-teal-700 ring-2 ring-teal-500/40"
+              title="Weighted Jaccard on metrics/tables/filters (and AST when available), threshold ≥ 0.80 — final fuzzy clustering layer"
+            >
+              <span className="text-teal-300">After Similarity:</span>{' '}
+              <span className="font-bold text-white">{summary.afterSimilarity.toLocaleString()}</span>
+              {clusterReducible > 0 && (
+                <span className="text-green-400 text-xs ml-1">({'\u2212'}{clusterReducible.toLocaleString()})</span>
+              )}
+            </span>
+          </div>
+        </div>
+      )}
+
+      <div className="bg-[#16213e] p-4 rounded-lg border-l-4 border-teal-500">
+        <h3 className="text-white font-bold mb-2">Jaccard Clustering (Weighted)</h3>
+        <p className="text-xs text-gray-400 leading-relaxed">
+          Lexical fuzzy clustering on post-AST canonicals using{' '}
+          <strong className="text-teal-300">weighted Jaccard</strong> over metric / table / filter /
+          AST-hash sets — with SQL:{' '}
+          <code className="mx-1 px-1 bg-[#0f0f1a] rounded text-teal-300">0.60 AST + 0.25 metrics + 0.15 tables</code>,
+          without SQL:{' '}
+          <code className="mx-1 px-1 bg-[#0f0f1a] rounded text-teal-300">0.40 metrics + 0.40 tables + 0.20 filters</code>.
+          Pairs ≥ 0.80 are linked; connected components form clusters. Unlike fingerprint/SQL-hash/AST
+          (provable dedup), these are <strong>fuzzy candidates</strong> that need human or LLM review
+          before collapse. The <strong className="text-teal-300">Semantic Clusters</strong> tab is an
+          alternative clustering on the same post-AST input that uses vector embeddings instead of
+          set-overlap — it catches synonyms and terminology drift this one misses.
+        </p>
+      </div>
+
+      {summary && (() => {
+        const multiClusters = clusters.filter((c) => !c.isSingletons);
+        const singletonEntry = clusters.find((c) => c.isSingletons);
+        const reportsInMulti = multiClusters.reduce((s, c) => s + c.size, 0);
+        const multiCount = multiClusters.length;
+        const singletonCount = singletonEntry?.size ?? 0;
+        const inputCount = reportsInMulti + singletonCount;
+        const collapsed = reportsInMulti - multiCount;
+        const finalUnique = multiCount + singletonCount;
+        return (
+          <div className="bg-[#0f1a26] p-4 rounded-lg border border-teal-700/40">
+            <div className="text-xs uppercase tracking-wider text-teal-300 font-bold mb-3">
+              How the Final Unique Count Is Derived
+            </div>
+            <div className="flex items-center flex-wrap gap-2 text-sm">
+              <span className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]">
+                <span className="text-gray-400">Post-AST survivors (input):</span>{' '}
+                <span className="font-bold text-white">{inputCount.toLocaleString()}</span>
+              </span>
+              <span className="text-gray-500">=</span>
+              <span className="px-3 py-1.5 bg-blue-900/20 rounded border border-blue-700/50">
+                <span className="text-blue-300">reports in multi-clusters:</span>{' '}
+                <span className="font-bold text-white">{reportsInMulti.toLocaleString()}</span>
+              </span>
+              <span className="text-gray-500">+</span>
+              <span className="px-3 py-1.5 bg-slate-800/40 rounded border border-slate-600/50">
+                <span className="text-slate-300">singletons:</span>{' '}
+                <span className="font-bold text-white">{singletonCount.toLocaleString()}</span>
+              </span>
+            </div>
+            <div className="flex items-center flex-wrap gap-2 text-sm mt-2">
+              <span className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]">
+                <span className="text-gray-400">After Similarity (final unique):</span>{' '}
+                <span className="font-bold text-teal-300">{finalUnique.toLocaleString()}</span>
+                {summary.afterSimilarity !== finalUnique && (
+                  <span className="text-red-400 text-xs ml-1" title="Summary value mismatch">
+                    (summary: {summary.afterSimilarity.toLocaleString()})
+                  </span>
+                )}
+              </span>
+              <span className="text-gray-500">=</span>
+              <span className="px-3 py-1.5 bg-blue-900/20 rounded border border-blue-700/50">
+                <span className="text-blue-300">cluster canonicals:</span>{' '}
+                <span className="font-bold text-white">{multiCount.toLocaleString()}</span>{' '}
+                <span className="text-gray-500 text-xs">(1 per multi-cluster)</span>
+              </span>
+              <span className="text-gray-500">+</span>
+              <span className="px-3 py-1.5 bg-slate-800/40 rounded border border-slate-600/50">
+                <span className="text-slate-300">singletons kept as-is:</span>{' '}
+                <span className="font-bold text-white">{singletonCount.toLocaleString()}</span>
+              </span>
+              <span className="text-gray-500">·</span>
+              <span className="px-3 py-1.5 bg-green-900/20 rounded border border-green-700/50">
+                <span className="text-green-300">reducible:</span>{' '}
+                <span className="font-bold text-white">{'\u2212'}{collapsed.toLocaleString()}</span>{' '}
+                <span className="text-gray-500 text-xs">(collapsed into canonicals)</span>
+              </span>
+            </div>
+          </div>
+        );
+      })()}
+
+      <div className="bg-[#16213e] p-6 rounded-lg">
       <h2 className="text-lg font-bold text-white mb-4">
-        Similarity Clusters <span className="text-sm text-gray-400 font-normal">({clusters.length} shown)</span>
+        Jaccard Clusters <span className="text-sm text-gray-400 font-normal">({clusters.length} shown)</span>
       </h2>
       <div className="mb-4 relative">
         <VscSearch className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" />
@@ -1828,29 +2342,863 @@ function ClustersTab({
         />
       </div>
       <div className="space-y-2 max-h-[70vh] overflow-y-auto pr-2">
-        {clusters.map((c) => (
-          <div
-            key={c.id}
-            onClick={() => onOpen(c)}
-            className="bg-[#0f0f1a] p-4 rounded-lg cursor-pointer hover:bg-[#1a2a4a] transition-colors border-l-4 border-blue-500"
-          >
-            <div className="flex justify-between items-center mb-2">
-              <div>
-                <span className="text-xs text-gray-500 font-mono mr-2">{c.id}</span>
-                <span className="text-white font-semibold text-sm">{c.primaryName}</span>
-              </div>
-              <div className="flex items-center gap-3">
-                <div className="bg-blue-600 text-white text-xs font-bold px-3 py-1 rounded-full">
-                  {c.size} reports
+        {clusters.map((c) => {
+          const sqlN = sqlCountByCluster.get(c.id) ?? 0;
+          const sqlBadgeClass =
+            sqlN === c.size
+              ? 'bg-emerald-900/50 text-emerald-300 border-emerald-700/50'
+              : sqlN === 0
+              ? 'bg-gray-800/60 text-gray-400 border-gray-700/50'
+              : 'bg-amber-900/40 text-amber-300 border-amber-700/50';
+          const isSingletons = c.isSingletons === true;
+          return (
+            <div
+              key={c.id}
+              onClick={() => onOpen(c)}
+              className={`p-4 rounded-lg cursor-pointer transition-colors border-l-4 ${
+                isSingletons
+                  ? 'bg-slate-900/60 hover:bg-slate-800/60 border-slate-400'
+                  : 'bg-[#0f0f1a] hover:bg-[#1a2a4a] border-blue-500'
+              }`}
+            >
+              <div className="flex justify-between items-center mb-2">
+                <div className="min-w-0 flex-1">
+                  <span className={`text-xs font-mono mr-2 ${isSingletons ? 'text-slate-300' : 'text-gray-500'}`}>
+                    {c.id}
+                  </span>
+                  {c.dataQuality === 'low' && c.dataQualityReason === 'empty_features' ? (
+                    <span className="text-amber-200 font-semibold text-sm italic" title="This isn't a real similarity cluster — it's a bucket of reports whose inventory extraction failed (no metrics/tables captured). The 'primary' name is arbitrary.">
+                      Unclassifiable — inventory extraction failed for most members
+                    </span>
+                  ) : (
+                    <>
+                      {!isSingletons && (
+                        <span
+                          className="text-[9px] font-bold text-amber-300 bg-amber-950/40 border border-amber-700/50 rounded px-1.5 py-0.5 mr-2 align-middle"
+                          title="Keep-candidate — the primary report of this cluster"
+                        >
+                          ⭐ PRIMARY
+                        </span>
+                      )}
+                      {!isSingletons && (
+                        <span className="mr-2 align-middle">
+                          <FamilySiblingsIndicator siblings={reportById.get(c.primaryReportId)?.familySiblings} />
+                        </span>
+                      )}
+                      <span className="text-white font-semibold text-sm" title={c.primaryReportId}>{c.primaryName}</span>
+                    </>
+                  )}
+                  {isSingletons && (
+                    <div className="text-xs text-slate-400 mt-0.5">
+                      Post-AST reports with no similarity pair {'\u2265'} 0.80 — browse or pick any two to compare.
+                    </div>
+                  )}
                 </div>
-                <VscChevronRight className="text-gray-500" />
+                <div className="flex items-center gap-3 flex-shrink-0">
+                  <DataQualityBadge cluster={c} />
+                  <span
+                    className={`text-xs font-semibold px-2 py-0.5 rounded border ${sqlBadgeClass}`}
+                    title="Count of members with extracted SQL"
+                  >
+                    SQL: {sqlN}/{c.size}
+                  </span>
+                  <div
+                    className={`text-white text-xs font-bold px-3 py-1 rounded-full ${
+                      isSingletons ? 'bg-slate-600' : 'bg-blue-600'
+                    }`}
+                  >
+                    {c.size} reports
+                  </div>
+                  <VscChevronRight className="text-gray-500" />
+                </div>
               </div>
+              {!isSingletons && (
+                <div className="text-xs text-gray-400">
+                  {c.totalExecutions.toLocaleString()} total executions · {c.commonMetrics.length} metrics · {c.commonTables.length} tables · {c.commonFilters.length} filter attrs
+                </div>
+              )}
+              {isSingletons && (
+                <div className="text-xs text-slate-400">
+                  {c.totalExecutions.toLocaleString()} total executions across all singletons
+                </div>
+              )}
             </div>
-            <div className="text-xs text-gray-400">
-              {c.totalExecutions.toLocaleString()} total executions · {c.commonMetrics.length} metrics · {c.commonTables.length} tables · {c.commonFilters.length} filter attrs
+          );
+        })}
+      </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// SEMANTIC CLUSTERS TAB
+// ─────────────────────────────────────────────────────────────────────
+
+const SEMANTIC_ACTION_COLORS: Record<string, string> = {
+  MERGE_IMMEDIATE: 'bg-red-900/50 text-red-200 border-red-700/60',
+  PARAMETERIZE: 'bg-orange-900/50 text-orange-200 border-orange-700/60',
+  REVIEW_WITH_OWNER: 'bg-yellow-900/40 text-yellow-200 border-yellow-700/60',
+  KEEP_SEPARATE: 'bg-slate-800/60 text-slate-300 border-slate-600/60',
+};
+
+function SemanticTab({
+  clusters,
+  search,
+  setSearch,
+  actionFilter,
+  setActionFilter,
+  summary,
+  reportById,
+  onOpen,
+  activeExpInfo,
+  onClearActive,
+  onGoToPlayground,
+}: {
+  clusters: SemanticCluster[];
+  search: string;
+  setSearch: (v: string) => void;
+  actionFilter: string;
+  setActionFilter: (v: string) => void;
+  summary: RationalizationSummary | null;
+  reportById: Map<string, ReportDetail>;
+  onOpen: (c: SemanticCluster) => void;
+  activeExpInfo?: ActiveExperimentInfo | null;
+  onClearActive?: () => void | Promise<void>;
+  onGoToPlayground?: () => void;
+}) {
+  const sqlCountByCluster = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const c of clusters) {
+      let n = 0;
+      for (const id of c.memberIds) {
+        if (reportById.get(id)?.sql) n++;
+      }
+      m.set(c.id, n);
+    }
+    return m;
+  }, [clusters, reportById]);
+
+  const filtered = useMemo(() => {
+    const q = search.toLowerCase().trim();
+    let list = clusters;
+    if (actionFilter !== 'all') {
+      list = list.filter((c) => c.llm?.action === actionFilter);
+    }
+    if (!q) return list;
+    return list.filter(
+      (c) =>
+        c.primaryName.toLowerCase().includes(q) ||
+        (c.llm?.label || '').toLowerCase().includes(q) ||
+        (c.llm?.businessFunction || '').toLowerCase().includes(q) ||
+        c.id.toLowerCase().includes(q)
+    );
+  }, [clusters, search, actionFilter]);
+
+  // Empty state — semantic stage hasn't been run yet
+  if (clusters.length === 0) {
+    return (
+      <div className="bg-[#16213e] p-8 rounded-lg text-center space-y-4">
+        <div className="text-4xl">🧭</div>
+        <h2 className="text-xl font-bold text-white">No semantic clusters yet</h2>
+        <p className="text-sm text-gray-400 max-w-2xl mx-auto">
+          This tab shows clusters formed by <strong className="text-teal-300">vector embedding</strong> of
+          each report's name, path, metrics, tables, filters, and normalized SQL — then grouped by
+          cosine similarity ≥ 0.85 in semantic space, and labeled by an LLM.
+        </p>
+        <p className="text-xs text-gray-500 max-w-2xl mx-auto">
+          Populate by running on the backend:
+        </p>
+        <pre className="inline-block text-left bg-[#0f0f1a] border border-[#1e2d50] rounded px-4 py-3 text-xs text-emerald-300 font-mono">
+          python -m db.compute.semantic --project <span className="text-gray-500">&lt;project-id&gt;</span>
+        </pre>
+        <p className="text-xs text-gray-500">
+          Then re-emit JSON with <code className="text-gray-400">python -m db.emit</code> and refresh.
+        </p>
+      </div>
+    );
+  }
+
+  const actionCounts: Record<string, number> = {};
+  clusters.forEach((c) => {
+    const a = c.llm?.action || 'UNREVIEWED';
+    actionCounts[a] = (actionCounts[a] || 0) + 1;
+  });
+  const totalReducible = clusters.reduce((s, c) => s + (c.llm?.removableCount || 0), 0);
+
+  const multiArr = clusters.filter((c) => !c.isSingletons);
+  const singEntry = clusters.find((c) => c.isSingletons);
+  const semFinalUnique = multiArr.length + (singEntry?.size ?? 0);
+
+  return (
+    <div className="space-y-4">
+      {activeExpInfo?.expId && (
+        <div className="bg-gradient-to-r from-amber-950/60 to-[#16213e] p-3 rounded-lg border border-amber-700/60 flex items-center gap-3">
+          <span className="text-2xl">⭐</span>
+          <div className="flex-1 min-w-0">
+            <div className="text-xs uppercase tracking-wider text-amber-300 font-bold">Showing Playground Experiment</div>
+            <div className="text-sm text-white mt-0.5">
+              <strong>{activeExpInfo.name || activeExpInfo.expId}</strong>
+              <span className="text-gray-400 ml-2 text-xs font-mono">{activeExpInfo.expId}</span>
+            </div>
+            <div className="text-[11px] text-gray-400 mt-0.5">
+              This view and its counts reflect the promoted experiment — not the pipeline's semantic_clusters.json.
             </div>
           </div>
-        ))}
+          {onGoToPlayground && (
+            <button onClick={onGoToPlayground}
+              className="text-xs text-amber-200 hover:text-white border border-amber-700/60 rounded px-2 py-1 flex-shrink-0">
+              Open Playground
+            </button>
+          )}
+          {onClearActive && (
+            <button onClick={() => onClearActive()}
+              className="text-xs text-amber-200 hover:text-white underline flex-shrink-0">
+              Revert to pipeline
+            </button>
+          )}
+        </div>
+      )}
+      {/* Pipeline lineage banner — Semantic is a parallel branch off post-AST */}
+      {summary && (
+        <div className="bg-gradient-to-r from-teal-950/60 to-[#16213e] p-4 rounded-lg border border-teal-800/40">
+          <div className="text-xs uppercase tracking-wider text-teal-300 font-bold mb-2">Pipeline Lineage</div>
+          <div className="flex items-center gap-2 text-sm flex-wrap">
+            <span className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]">
+              <span className="text-gray-400">Inventory:</span>{' '}
+              <span className="font-bold text-white">{summary.totalInventory.toLocaleString()}</span>
+            </span>
+            <span className="text-gray-500">{'\u2192'}</span>
+            <span className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]">
+              <span className="text-gray-400">After telemetry:</span>{' '}
+              <span className="font-bold text-white">{summary.afterTelemetry.toLocaleString()}</span>
+              <span className="text-red-400 text-xs ml-1">({'\u2212'}{summary.retired.toLocaleString()})</span>
+            </span>
+            {summary.afterCollisionCollapse !== undefined && summary.collisionCollapsed !== undefined && summary.collisionCollapsed > 0 && (
+              <>
+                <span className="text-gray-500">{'\u2192'}</span>
+                <span
+                  className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]"
+                  title="Same telemetry row attributed to multiple MSTR objects — collapsed to one canonical"
+                >
+                  <span className="text-gray-400">After collision collapse:</span>{' '}
+                  <span className="font-bold text-white">{summary.afterCollisionCollapse.toLocaleString()}</span>
+                  <span className="text-amber-400 text-xs ml-1">({'\u2212'}{summary.collisionCollapsed.toLocaleString()})</span>
+                </span>
+              </>
+            )}
+            <span className="text-gray-500">{'\u2192'}</span>
+            <span className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]">
+              <span className="text-gray-400">After Fingerprint:</span>{' '}
+              <span className="font-bold text-white">{summary.afterFingerprint?.toLocaleString() ?? '-'}</span>
+              {summary.fingerprintRemovable !== undefined && (
+                <span className="text-green-400 text-xs ml-1">({'\u2212'}{summary.fingerprintRemovable.toLocaleString()})</span>
+              )}
+            </span>
+            {summary.afterSqlHash !== undefined && (
+              <>
+                <span className="text-gray-500">{'\u2192'}</span>
+                <span className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]">
+                  <span className="text-blue-300">After SQL Hash:</span>{' '}
+                  <span className="font-bold text-white">{summary.afterSqlHash.toLocaleString()}</span>
+                  {summary.sqlHashSequentialRemovable !== undefined && summary.sqlHashSequentialRemovable > 0 ? (
+                    <span className="text-green-400 text-xs ml-1">({'\u2212'}{summary.sqlHashSequentialRemovable.toLocaleString()})</span>
+                  ) : (
+                    <span className="text-gray-500 text-xs ml-1">(0 new)</span>
+                  )}
+                </span>
+              </>
+            )}
+            {summary.afterAst !== undefined && (
+              <>
+                <span className="text-gray-500">{'\u2192'}</span>
+                <span className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]">
+                  <span className="text-pink-300">After AST:</span>{' '}
+                  <span className="font-bold text-white">{summary.afterAst.toLocaleString()}</span>
+                  {summary.astSequentialRemovable !== undefined && summary.astSequentialRemovable > 0 && (
+                    <span className="text-green-400 text-xs ml-1">
+                      ({'\u2212'}{summary.astSequentialRemovable.toLocaleString()})
+                    </span>
+                  )}
+                </span>
+              </>
+            )}
+            {summary.afterPostAstFamily !== undefined && (
+              <>
+                <span className="text-gray-500">{'\u2192'}</span>
+                <span
+                  className="px-3 py-1.5 bg-orange-900/20 rounded border border-orange-700/50"
+                  title="Post-AST Family collapse — name-sibling canonicals (e.g., GFE085a-ACC, GFE085a-MENS) collapsed to 1 per family. Input to both Similarity and Semantic."
+                >
+                  <span className="text-orange-300">After Family (clustering input):</span>{' '}
+                  <span className="font-bold text-white">{summary.afterPostAstFamily.toLocaleString()}</span>
+                  {summary.postAstFamilyCollapsed !== undefined && summary.postAstFamilyCollapsed > 0 && (
+                    <span className="text-green-400 text-xs ml-1">
+                      ({'\u2212'}{summary.postAstFamilyCollapsed.toLocaleString()})
+                    </span>
+                  )}
+                </span>
+              </>
+            )}
+            {/* Branch indicator — Semantic is parallel to Similarity */}
+            <span className="text-gray-500 font-mono">{'\u21B3'}</span>
+            <span
+              className="px-3 py-1.5 bg-teal-900/40 rounded border border-teal-700 ring-2 ring-teal-500/40"
+              title="Embedding + cosine >= 0.85, LLM-labeled — a parallel alternative to the lexical Similarity branch"
+            >
+              <span className="text-teal-300">After Semantic:</span>{' '}
+              <span className="font-bold text-white">{semFinalUnique.toLocaleString()}</span>
+              {(() => {
+                const clusteringInput = summary.afterPostAstFamily ?? summary.afterAst ?? 0;
+                const graphDelta = clusteringInput - semFinalUnique;
+                return graphDelta > 0 ? (
+                  <span className="text-amber-400 text-xs ml-1" title="Graph-reducible: 1 canonical per multi-member cluster kept, rest collapsed">
+                    (graph {'\u2212'}{graphDelta.toLocaleString()})
+                  </span>
+                ) : null;
+              })()}
+              {totalReducible > 0 && (
+                <span className="text-green-400 text-xs ml-1" title="LLM-judged removable per cluster">
+                  (LLM {'\u2212'}{totalReducible.toLocaleString()})
+                </span>
+              )}
+            </span>
+          </div>
+          {/* Parallel-branch note */}
+          <div className="text-xs text-gray-500 mt-3 flex items-center gap-2 flex-wrap">
+            <span className="font-semibold text-gray-400">Parallel branch:</span>
+            <span className="text-gray-500">post-AST-family</span>
+            <span className="font-mono">{'\u2192'}</span>
+            <span className="px-2 py-0.5 bg-[#0f0f1a] rounded border border-[#2a2a4a] text-gray-400">
+              After Similarity:{' '}
+              <span className="text-white font-semibold">{summary.afterSimilarity.toLocaleString()}</span>
+              {(() => {
+                const input = summary.afterPostAstFamily ?? summary.afterAst ?? 0;
+                const delta = input - summary.afterSimilarity;
+                return delta > 0 ? (
+                  <span className="text-amber-400 ml-1">
+                    (graph {'\u2212'}{delta.toLocaleString()})
+                  </span>
+                ) : null;
+              })()}
+            </span>
+            <span className="text-gray-600">
+              &nbsp;— lexical weighted Jaccard on the same input. Semantic and Similarity both read the
+              same {(summary.afterPostAstFamily ?? summary.afterAst)?.toLocaleString() ?? '?'} post-family reports; they do not chain.
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* Method description */}
+      <div className="bg-gradient-to-r from-teal-950/40 to-[#16213e] p-4 rounded-lg border border-teal-800/40">
+        <div className="text-xs uppercase tracking-wider text-teal-300 font-bold mb-2">
+          Pipeline — Embedding Layer
+        </div>
+        <p className="text-xs text-gray-400 leading-relaxed">
+          Every post-AST survivor is embedded via <strong className="text-teal-300">OpenAI
+          text-embedding-3-large</strong> (3072-dim) on the concatenation of its name, path,
+          metrics, tables, filters and normalized SQL. Pairs with cosine similarity ≥ 0.85 form
+          edges; connected components are the clusters below. Each multi-member cluster is then
+          labeled by an LLM for business function, relationship, and consolidation action.
+          Unlike the lexical Similarity tab, this layer tolerates synonym variation and catches
+          reports doing the same job with different terminology.
+        </p>
+      </div>
+
+      {/* KPI cards */}
+      <div className="grid grid-cols-4 gap-4">
+        <div className="bg-[#16213e] p-4 rounded-lg border-l-4 border-teal-500">
+          <div className="text-xs text-gray-400 uppercase mb-1">Multi-member</div>
+          <div className="text-2xl font-bold text-white">
+            {clusters.filter((c) => !c.isSingletons).length.toLocaleString()}
+          </div>
+        </div>
+        <div className="bg-[#16213e] p-4 rounded-lg border-l-4 border-slate-500">
+          <div className="text-xs text-gray-400 uppercase mb-1">Singletons</div>
+          <div className="text-2xl font-bold text-white">
+            {(clusters.find((c) => c.isSingletons)?.size ?? 0).toLocaleString()}
+          </div>
+        </div>
+        <div className="bg-[#16213e] p-4 rounded-lg border-l-4 border-green-500">
+          <div className="text-xs text-gray-400 uppercase mb-1">LLM Removable</div>
+          <div className="text-2xl font-bold text-green-400">{totalReducible.toLocaleString()}</div>
+          <div className="text-xs text-gray-500">summed across clusters</div>
+        </div>
+        <div className="bg-[#16213e] p-4 rounded-lg border-l-4 border-purple-500">
+          <div className="text-xs text-gray-400 uppercase mb-1">LLM Reviewed</div>
+          <div className="text-2xl font-bold text-white">
+            {clusters.filter((c) => c.llm && !c.llm.error).length.toLocaleString()}
+          </div>
+        </div>
+      </div>
+
+      {/* Accounting card — same shape as the Clusters tab */}
+      {(() => {
+        const multi = clusters.filter((c) => !c.isSingletons);
+        const singEntry = clusters.find((c) => c.isSingletons);
+        const reportsInMulti = multi.reduce((s, c) => s + c.size, 0);
+        const multiCount = multi.length;
+        const singletonCount = singEntry?.size ?? 0;
+        const inputCount = reportsInMulti + singletonCount;
+        const collapsed = reportsInMulti - multiCount;  // pure graph reducibility (size − 1 per cluster)
+        const finalUnique = multiCount + singletonCount;
+        return (
+          <div className="bg-[#0f1a26] p-4 rounded-lg border border-teal-700/40">
+            <div className="text-xs uppercase tracking-wider text-teal-300 font-bold mb-3">
+              How the Semantic Counts Add Up
+            </div>
+            <div className="flex items-center flex-wrap gap-2 text-sm">
+              <span className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]">
+                <span className="text-gray-400">Post-AST survivors (input):</span>{' '}
+                <span className="font-bold text-white">{inputCount.toLocaleString()}</span>
+              </span>
+              <span className="text-gray-500">=</span>
+              <span className="px-3 py-1.5 bg-teal-900/20 rounded border border-teal-700/50">
+                <span className="text-teal-300">reports in multi-clusters:</span>{' '}
+                <span className="font-bold text-white">{reportsInMulti.toLocaleString()}</span>
+              </span>
+              <span className="text-gray-500">+</span>
+              <span className="px-3 py-1.5 bg-slate-800/40 rounded border border-slate-600/50">
+                <span className="text-slate-300">singletons:</span>{' '}
+                <span className="font-bold text-white">{singletonCount.toLocaleString()}</span>
+              </span>
+            </div>
+            <div className="flex items-center flex-wrap gap-2 text-sm mt-2">
+              <span className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]">
+                <span className="text-gray-400">After semantic (graph unique):</span>{' '}
+                <span className="font-bold text-teal-300">{finalUnique.toLocaleString()}</span>
+              </span>
+              <span className="text-gray-500">=</span>
+              <span className="px-3 py-1.5 bg-teal-900/20 rounded border border-teal-700/50">
+                <span className="text-teal-300">cluster canonicals:</span>{' '}
+                <span className="font-bold text-white">{multiCount.toLocaleString()}</span>{' '}
+                <span className="text-gray-500 text-xs">(1 per multi-cluster)</span>
+              </span>
+              <span className="text-gray-500">+</span>
+              <span className="px-3 py-1.5 bg-slate-800/40 rounded border border-slate-600/50">
+                <span className="text-slate-300">singletons kept:</span>{' '}
+                <span className="font-bold text-white">{singletonCount.toLocaleString()}</span>
+              </span>
+              <span className="text-gray-500">·</span>
+              <span className="px-3 py-1.5 bg-green-900/20 rounded border border-green-700/50">
+                <span className="text-green-300">graph-reducible:</span>{' '}
+                <span className="font-bold text-white">−{collapsed.toLocaleString()}</span>{' '}
+                <span className="text-gray-500 text-xs">(size−1 per cluster)</span>
+              </span>
+              <span className="px-3 py-1.5 bg-green-900/30 rounded border border-green-700/60">
+                <span className="text-green-300">LLM-removable:</span>{' '}
+                <span className="font-bold text-white">−{totalReducible.toLocaleString()}</span>{' '}
+                <span className="text-gray-500 text-xs">(LLM judgment)</span>
+              </span>
+            </div>
+            <p className="text-xs text-gray-500 mt-2 leading-relaxed">
+              <strong className="text-gray-400">Graph-reducible</strong> treats every multi-member cluster as 1 canonical
+              (size − 1 removable). <strong className="text-gray-400">LLM-removable</strong> is the per-cluster judgment
+              — the LLM may mark fewer (KEEP_SEPARATE, REVIEW_WITH_OWNER) or accept the full size − 1 (MERGE_IMMEDIATE,
+              PARAMETERIZE). Use LLM-removable as the defensible collapse target.
+            </p>
+          </div>
+        );
+      })()}
+
+      {/* Action filter + search */}
+      <div className="bg-[#16213e] p-4 rounded-lg">
+        <div className="flex gap-3 mb-3 flex-wrap">
+          <button
+            onClick={() => setActionFilter('all')}
+            className={`text-xs px-3 py-1 rounded border ${
+              actionFilter === 'all'
+                ? 'bg-blue-600 text-white border-blue-500'
+                : 'bg-[#0f0f1a] text-gray-400 border-[#1e2d50]'
+            }`}
+          >
+            All ({clusters.length})
+          </button>
+          {Object.entries(actionCounts)
+            .sort((a, b) => b[1] - a[1])
+            .map(([a, n]) => (
+              <button
+                key={a}
+                onClick={() => setActionFilter(a)}
+                className={`text-xs px-3 py-1 rounded border ${
+                  actionFilter === a
+                    ? SEMANTIC_ACTION_COLORS[a] || 'bg-blue-600 text-white border-blue-500'
+                    : 'bg-[#0f0f1a] text-gray-400 border-[#1e2d50]'
+                }`}
+              >
+                {a} ({n})
+              </button>
+            ))}
+        </div>
+        <div className="relative">
+          <VscSearch className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" />
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search by name, label, or business function..."
+            className="w-full bg-[#0f0f1a] border border-[#1e2d50] rounded-lg pl-10 pr-4 py-2.5 text-white text-sm focus:outline-none focus:border-blue-500"
+          />
+        </div>
+      </div>
+
+      {/* Cluster list */}
+      <div className="space-y-2 max-h-[65vh] overflow-y-auto pr-2">
+        {filtered.map((c) => {
+          const isSingletons = c.isSingletons === true;
+          const action = c.llm?.action || 'UNREVIEWED';
+          const actionCls = SEMANTIC_ACTION_COLORS[action] || 'bg-slate-800/60 text-slate-300 border-slate-700/60';
+          const sqlN = sqlCountByCluster.get(c.id) ?? 0;
+          const sqlBadge =
+            sqlN === c.size
+              ? 'bg-emerald-900/50 text-emerald-300 border-emerald-700/50'
+              : sqlN === 0
+              ? 'bg-gray-800/60 text-gray-400 border-gray-700/50'
+              : 'bg-amber-900/40 text-amber-300 border-amber-700/50';
+          return (
+            <div
+              key={c.id}
+              onClick={() => onOpen(c)}
+              className={`p-4 rounded-lg cursor-pointer transition-colors border-l-4 ${
+                isSingletons
+                  ? 'bg-slate-900/60 hover:bg-slate-800/60 border-slate-400'
+                  : 'bg-[#0f0f1a] hover:bg-[#1a2a4a] border-teal-500'
+              }`}
+            >
+              <div className="flex justify-between items-start gap-3">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center flex-wrap gap-2 mb-1">
+                    <span className={`text-xs font-mono ${isSingletons ? 'text-slate-300' : 'text-teal-300'}`}>
+                      {c.id}
+                    </span>
+                    {!isSingletons && c.dataQuality === 'low' && c.dataQualityReason === 'empty_features' ? (
+                      <span className="text-xs text-amber-200 font-semibold italic">
+                        Unclassifiable — inventory extraction failed for most members
+                      </span>
+                    ) : (
+                      !isSingletons && c.llm?.label && (
+                        <span className="text-xs text-white font-semibold">{c.llm.label}</span>
+                      )
+                    )}
+                    {!isSingletons && c.dataQuality !== 'low' && c.llm?.action && (
+                      <span className={`text-xs font-bold px-2 py-0.5 rounded border ${actionCls}`}>
+                        {c.llm.action}
+                      </span>
+                    )}
+                    {!isSingletons && c.dataQuality !== 'low' && c.llm?.confidence && (
+                      <span className="text-xs text-gray-500">conf: {c.llm.confidence}</span>
+                    )}
+                    {!isSingletons && <DataQualityBadge cluster={c} />}
+                  </div>
+                  <div className="text-sm text-gray-200 truncate flex items-center gap-2">
+                    {!isSingletons && (
+                      <span
+                        className="text-[9px] font-bold text-amber-300 bg-amber-950/40 border border-amber-700/50 rounded px-1.5 py-0.5 flex-shrink-0"
+                        title="Keep-candidate — the primary report of this cluster"
+                      >
+                        ⭐ PRIMARY
+                      </span>
+                    )}
+                    {!isSingletons && (
+                      <FamilySiblingsIndicator siblings={reportById.get(c.primaryReportId)?.familySiblings} />
+                    )}
+                    <span className="truncate" title={c.primaryReportId}>
+                      {c.dataQuality === 'low' && c.dataQualityReason === 'empty_features'
+                        ? <span className="italic text-gray-500">(primary name "{c.primaryName}" not meaningful — picked arbitrarily from reports with no metadata)</span>
+                        : c.primaryName}
+                    </span>
+                  </div>
+                  {!isSingletons && (
+                    <div className="text-xs text-gray-500 mt-1">
+                      {c.totalExecutions.toLocaleString()} execs ·{' '}
+                      avg cosine {c.avgCosine != null ? c.avgCosine.toFixed(3) : '—'} ·{' '}
+                      min {c.minCosine != null ? c.minCosine.toFixed(3) : '—'}
+                      {c.llm?.removableCount ? (
+                        <span className="text-green-400 ml-2">· −{c.llm.removableCount} removable</span>
+                      ) : null}
+                    </div>
+                  )}
+                  {isSingletons && (
+                    <div className="text-xs text-slate-400 mt-1">
+                      Post-AST reports with no semantic pair ≥ threshold — click to browse & compare
+                    </div>
+                  )}
+                </div>
+                <div className="flex items-center gap-2 flex-shrink-0">
+                  <span
+                    className={`text-xs font-semibold px-2 py-0.5 rounded border ${sqlBadge}`}
+                    title="Members with extracted SQL"
+                  >
+                    SQL: {sqlN}/{c.size}
+                  </span>
+                  <div
+                    className={`text-white text-xs font-bold px-3 py-1 rounded-full ${
+                      isSingletons ? 'bg-slate-600' : 'bg-teal-600'
+                    }`}
+                  >
+                    {c.size} reports
+                  </div>
+                  <VscChevronRight className="text-gray-500" />
+                </div>
+              </div>
+            </div>
+          );
+        })}
+        {filtered.length === 0 && (
+          <div className="text-center text-sm text-gray-500 py-10">
+            No clusters match the current filter.
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SemanticClusterModal({
+  cluster,
+  reportById,
+  onClose,
+  onCompare,
+}: {
+  cluster: SemanticCluster;
+  reportById: Map<string, ReportDetail>;
+  onClose: () => void;
+  onCompare: (a: ReportDetail, b: ReportDetail) => void;
+}) {
+  const [selectedForCompare, setSelectedForCompare] = useState<string[]>([]);
+  const members = useMemo(() => {
+    const enriched = cluster.members
+      .map((m) => ({ ...m, report: reportById.get(m.id) }))
+      .filter((m) => m.report);
+    // Pin the primary first; sort the rest by cosineToPrimary desc (falls
+    // back to executions if cosine isn't available, e.g. for promoted
+    // Playground experiments).
+    const primary = enriched.find((m) => m.id === cluster.primaryReportId);
+    const rest = enriched
+      .filter((m) => m.id !== cluster.primaryReportId)
+      .sort((a, b) => {
+        const ca = a.cosineToPrimary, cb = b.cosineToPrimary;
+        if (ca != null && cb != null) return cb - ca;
+        return (b.report?.executions ?? 0) - (a.report?.executions ?? 0);
+      });
+    return primary ? [primary, ...rest] : rest;
+  }, [cluster, reportById]);
+  const sqlCount = useMemo(
+    () => members.filter((m) => !!m.report?.sql).length,
+    [members]
+  );
+
+  function toggle(id: string) {
+    if (selectedForCompare.includes(id)) {
+      setSelectedForCompare((s) => s.filter((x) => x !== id));
+    } else if (selectedForCompare.length < 2) {
+      setSelectedForCompare((s) => [...s, id]);
+    } else {
+      setSelectedForCompare([selectedForCompare[1], id]);
+    }
+  }
+
+  function handleCompareClick() {
+    if (selectedForCompare.length === 2) {
+      const a = reportById.get(selectedForCompare[0]);
+      const b = reportById.get(selectedForCompare[1]);
+      if (a && b) {
+        onCompare(a, b);
+        onClose();
+      }
+    }
+  }
+
+  const llm = cluster.llm;
+  return (
+    <div
+      className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-6"
+      onClick={onClose}
+    >
+      <div
+        className="bg-[#16213e] rounded-lg max-w-5xl w-full max-h-[92vh] overflow-hidden flex flex-col"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="p-5 border-b border-[#1e2d50] flex justify-between items-start">
+          <div className="min-w-0 flex-1">
+            <div className="text-xs text-gray-500 font-mono mb-1">{cluster.id}</div>
+            <h2 className="text-xl font-bold text-white truncate">
+              {llm?.label || cluster.primaryName}
+            </h2>
+            {llm?.label && (
+              <div className="text-sm text-gray-400 truncate">Primary: {cluster.primaryName}</div>
+            )}
+            <div className="text-xs text-gray-400 mt-2 flex items-center gap-3 flex-wrap">
+              <span>
+                {cluster.size} reports · {cluster.totalExecutions.toLocaleString()} execs
+              </span>
+              <span>
+                avg cosine {cluster.avgCosine != null ? cluster.avgCosine.toFixed(3) : '—'} ·{' '}
+                min {cluster.minCosine != null ? cluster.minCosine.toFixed(3) : '—'}
+              </span>
+              <span
+                className={`text-xs px-2 py-0.5 rounded font-semibold ${
+                  sqlCount === members.length
+                    ? 'bg-emerald-900/50 text-emerald-300 border border-emerald-700/50'
+                    : sqlCount === 0
+                    ? 'bg-gray-800/60 text-gray-400 border border-gray-700/50'
+                    : 'bg-amber-900/40 text-amber-300 border border-amber-700/50'
+                }`}
+              >
+                SQL: {sqlCount}/{members.length}
+              </span>
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            className="text-gray-400 hover:text-white text-2xl leading-none flex-shrink-0 ml-3"
+          >
+            ×
+          </button>
+        </div>
+
+        {/* LLM panel */}
+        {llm && !llm.error && (
+          <div className="p-5 bg-gradient-to-r from-teal-950/40 to-[#16213e] border-b border-[#1e2d50] space-y-2 text-sm">
+            <div className="flex gap-2 flex-wrap items-center">
+              {llm.action && (
+                <span
+                  className={`text-xs font-bold px-2 py-1 rounded border ${
+                    SEMANTIC_ACTION_COLORS[llm.action] ||
+                    'bg-slate-800 text-slate-300 border-slate-700'
+                  }`}
+                >
+                  {llm.action}
+                </span>
+              )}
+              {llm.relationship && (
+                <span className="text-xs bg-[#0f0f1a] text-teal-200 px-2 py-1 rounded border border-teal-800/60">
+                  {llm.relationship}
+                </span>
+              )}
+              {llm.confidence && (
+                <span className="text-xs text-gray-500">Confidence: {llm.confidence}</span>
+              )}
+              {llm.removableCount > 0 && (
+                <span className="text-xs bg-green-900/40 text-green-200 px-2 py-1 rounded border border-green-800/60">
+                  −{llm.removableCount} removable
+                </span>
+              )}
+            </div>
+            {llm.businessFunction && (
+              <div className="text-sm text-gray-300">
+                <span className="text-gray-400 font-semibold">Business function:</span>{' '}
+                {llm.businessFunction}
+              </div>
+            )}
+            {llm.detail && (
+              <div className="text-sm text-gray-300">
+                <span className="text-gray-400 font-semibold">Recommendation:</span> {llm.detail}
+              </div>
+            )}
+            {llm.keepReport && (
+              <div className="text-sm text-gray-300">
+                <span className="text-gray-400 font-semibold">Keep:</span> {llm.keepReport}
+              </div>
+            )}
+          </div>
+        )}
+        {llm?.error && (
+          <div className="p-4 bg-red-950/30 border-b border-red-900/40 text-xs text-red-300">
+            LLM review failed: {llm.error}
+          </div>
+        )}
+
+        <div className="p-5 overflow-y-auto flex-1">
+          {selectedForCompare.length === 2 && (
+            <button
+              onClick={handleCompareClick}
+              className="mb-3 w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2.5 rounded-lg"
+            >
+              Compare Selected Reports →
+            </button>
+          )}
+          <div className="bg-[#0f0f1a] p-3 rounded mb-3 text-xs text-gray-400 flex items-center gap-2">
+            <VscDiff className="text-teal-400" />
+            Select up to 2 reports to compare side-by-side
+          </div>
+          <table className="w-full text-sm">
+            <thead className="bg-[#0f0f1a]">
+              <tr>
+                <th className="text-left p-2 text-xs text-gray-400 uppercase w-8"></th>
+                <th className="text-left p-2 text-xs text-gray-400 uppercase w-24">Role</th>
+                <th className="text-left p-2 text-xs text-gray-400 uppercase">Report Name</th>
+                <th className="text-left p-2 text-xs text-gray-400 uppercase w-16">Source</th>
+                <th className="text-right p-2 text-xs text-gray-400 uppercase w-24">Cosine</th>
+                <th className="text-center p-2 text-xs text-gray-400 uppercase w-16">SQL</th>
+                <th className="text-right p-2 text-xs text-gray-400 uppercase">Execs</th>
+                <th className="text-right p-2 text-xs text-gray-400 uppercase">Users</th>
+              </tr>
+            </thead>
+            <tbody>
+              {members.map((m) => {
+                const r = m.report!;
+                const selected = selectedForCompare.includes(r.id);
+                const hasSql = !!r.sql;
+                const isPrimary = m.id === cluster.primaryReportId;
+                return (
+                  <tr
+                    key={r.id}
+                    onClick={() => toggle(r.id)}
+                    className={`border-t border-[#1e2d50] cursor-pointer ${
+                      selected ? 'bg-teal-900/30'
+                        : isPrimary ? 'bg-amber-950/30 hover:bg-amber-900/30'
+                        : 'hover:bg-[#1a2a4a]'
+                    }`}
+                  >
+                    <td className="p-2">
+                      <input
+                        type="checkbox"
+                        checked={selected}
+                        onChange={() => {}}
+                        className="accent-teal-500"
+                      />
+                    </td>
+                    <td className="p-2">
+                      <div className="flex items-center gap-1 flex-wrap">
+                        {isPrimary ? (
+                          <span className="text-[10px] font-bold text-amber-300 bg-amber-950/50 border border-amber-700/60 rounded px-1.5 py-0.5 whitespace-nowrap"
+                            title="Keep-candidate — the primary report of this cluster">
+                            ⭐ PRIMARY
+                          </span>
+                        ) : (
+                          <span className="text-[10px] text-gray-500">member</span>
+                        )}
+                        <FamilySiblingsIndicator siblings={r.familySiblings} />
+                      </div>
+                    </td>
+                    <td className={`p-2 ${isPrimary ? 'text-amber-100 font-semibold' : 'text-white'}`}>{r.name}</td>
+                    <td className="p-2"><SourceTypePill sourceType={r.sourceType} /></td>
+                    <td className="p-2 text-right font-mono text-teal-300">
+                      {isPrimary ? '—' : (m.cosineToPrimary != null ? m.cosineToPrimary.toFixed(3) : '—')}
+                    </td>
+                    <td className="p-2 text-center">
+                      {hasSql ? (
+                        <span className="text-xs font-semibold text-emerald-300 bg-emerald-900/40 border border-emerald-700/50 px-2 py-0.5 rounded">
+                          ✓
+                        </span>
+                      ) : (
+                        <span className="text-xs font-semibold text-gray-500 bg-gray-800/60 border border-gray-700/50 px-2 py-0.5 rounded">
+                          —
+                        </span>
+                      )}
+                    </td>
+                    <td className={`p-2 text-right font-mono ${isPrimary ? 'text-amber-200' : 'text-gray-300'}`}>
+                      {r.executions.toLocaleString()}
+                    </td>
+                    <td className="p-2 text-right font-mono text-gray-300">{r.users}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
   );
@@ -1863,43 +3211,117 @@ function ClustersTab({
 function ReportsTab({
   reports,
   totalCount,
+  allReports,
+  finalKeptCount,
   search,
   setSearch,
   sort,
   setSort,
   pathFilter,
   setPathFilter,
+  sourceFilter,
+  setSourceFilter,
+  scope,
+  setScope,
   clusters,
   onOpenCluster,
+  onOpenReport,
+  projectId,
+  projectName,
 }: {
   reports: ReportDetail[];
   totalCount: number;
+  allReports: ReportDetail[];
+  finalKeptCount: number;
   search: string;
   setSearch: (v: string) => void;
   sort: 'executions' | 'name' | 'users';
   setSort: (v: 'executions' | 'name' | 'users') => void;
   pathFilter: 'all' | 'public' | 'personal';
   setPathFilter: (v: 'all' | 'public' | 'personal') => void;
+  sourceFilter: 'all' | 'normal' | 'cube' | 'custom_sql_free_form' | 'none';
+  setSourceFilter: (v: 'all' | 'normal' | 'cube' | 'custom_sql_free_form' | 'none') => void;
+  scope: 'final' | 'all';
+  setScope: (v: 'final' | 'all') => void;
   clusters: ClusterMeta[];
   onOpenCluster: (c: ClusterMeta) => void;
+  onOpenReport: (r: ReportDetail) => void;
+  projectId: string;
+  projectName: string;
 }) {
+  const [chatOpen, setChatOpen] = useState(false);
   const clusterById = useMemo(() => {
     const map = new Map<string, ClusterMeta>();
     clusters.forEach((c) => map.set(c.id, c));
     return map;
   }, [clusters]);
 
-  return (
-    <div className="bg-[#16213e] p-6 rounded-lg">
-      <h2 className="text-lg font-bold text-white mb-4">
-        All Active Reports{' '}
-        <span className="text-sm text-gray-400 font-normal">
-          ({reports.length.toLocaleString()} of {totalCount.toLocaleString()} shown)
-        </span>
-      </h2>
+  // Per-source counts (scope-aware) to drive the filter dropdown labels
+  const scopeBase = scope === 'final'
+    ? allReports.filter((r) => r.isFinalCanonical === true)
+    : allReports;
+  const sourceCounts = {
+    all: scopeBase.length,
+    normal: scopeBase.filter((r) => (r.sourceType || '') === 'normal').length,
+    cube: scopeBase.filter((r) => (r.sourceType || '') === 'cube').length,
+    custom_sql_free_form: scopeBase.filter((r) => (r.sourceType || '') === 'custom_sql_free_form').length,
+    none: scopeBase.filter((r) => (r.sourceType || '').trim() === '').length,
+  };
 
-      <div className="flex gap-3 mb-4">
-        <div className="flex-1 relative">
+  const title = scope === 'final' ? 'Final Reports to Keep' : 'All Reports (full inventory)';
+  return (
+    <div className="bg-[#16213e] p-6 rounded-lg relative">
+      <div className="flex items-start justify-between">
+        <h2 className="text-lg font-bold text-white mb-1">
+          {title}{' '}
+          <span className="text-sm text-gray-400 font-normal">
+            ({reports.length.toLocaleString()} of {totalCount.toLocaleString()} shown)
+          </span>
+        </h2>
+        <button
+          onClick={() => setChatOpen((v) => !v)}
+          className={`flex items-center gap-2 text-sm font-semibold px-4 py-2 rounded-lg border transition-colors ${
+            chatOpen
+              ? 'bg-fuchsia-900/50 text-fuchsia-200 border-fuchsia-600'
+              : 'bg-fuchsia-600 hover:bg-fuchsia-500 text-white border-fuchsia-500'
+          }`}
+          title="Ask questions about this project's rationalization data"
+        >
+          🤖 {chatOpen ? 'Hide' : 'Ask'} AI Assistant
+        </button>
+      </div>
+      <p className="text-xs text-gray-500 mb-4">
+        {scope === 'final'
+          ? `Canonical set after every pipeline stage (${finalKeptCount.toLocaleString()} reports): similarity-cluster primaries + post-AST singletons. Click any row for details.`
+          : `Full inventory across all statuses — active, retired, collapsed, dossier. Use this scope to audit reports that didn't make it to the final-kept set (e.g. all cube-sourced, retired, collapsed).`}
+      </p>
+
+      {/* Scope toggle — final-kept vs full inventory */}
+      <div className="flex gap-2 mb-3">
+        <button
+          onClick={() => setScope('final')}
+          className={`text-xs px-3 py-1.5 rounded border ${
+            scope === 'final'
+              ? 'bg-emerald-900/50 text-emerald-300 border-emerald-700 ring-1 ring-emerald-500/40'
+              : 'bg-[#0f0f1a] text-gray-400 border-[#1e2d50] hover:bg-[#1a2a4a]'
+          }`}
+        >
+          Final-kept only ({finalKeptCount.toLocaleString()})
+        </button>
+        <button
+          onClick={() => setScope('all')}
+          className={`text-xs px-3 py-1.5 rounded border ${
+            scope === 'all'
+              ? 'bg-blue-900/50 text-blue-300 border-blue-700 ring-1 ring-blue-500/40'
+              : 'bg-[#0f0f1a] text-gray-400 border-[#1e2d50] hover:bg-[#1a2a4a]'
+          }`}
+        >
+          All reports ({allReports.length.toLocaleString()})
+        </button>
+      </div>
+
+      <div className="flex gap-3 mb-4 flex-wrap">
+        <div className="flex-1 relative min-w-[240px]">
           <VscSearch className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" />
           <input
             type="text"
@@ -1919,6 +3341,18 @@ function ReportsTab({
           <option value="name">Sort: Name</option>
         </select>
         <select
+          value={sourceFilter}
+          onChange={(e) => setSourceFilter(e.target.value as typeof sourceFilter)}
+          className="bg-[#0f0f1a] border border-[#1e2d50] rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none"
+          title="Filter by report source type"
+        >
+          <option value="all">Source: All ({sourceCounts.all.toLocaleString()})</option>
+          <option value="normal">Source: SQL ({sourceCounts.normal.toLocaleString()})</option>
+          <option value="cube">Source: Cube ({sourceCounts.cube.toLocaleString()})</option>
+          <option value="custom_sql_free_form">Source: Free SQL ({sourceCounts.custom_sql_free_form.toLocaleString()})</option>
+          <option value="none">Source: Unknown ({sourceCounts.none.toLocaleString()})</option>
+        </select>
+        <select
           value={pathFilter}
           onChange={(e) => setPathFilter(e.target.value as 'all' | 'public' | 'personal')}
           className="bg-[#0f0f1a] border border-[#1e2d50] rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none"
@@ -1934,38 +3368,74 @@ function ReportsTab({
           <thead className="bg-[#0f0f1a] sticky top-0">
             <tr>
               <th className="text-left p-3 text-xs text-gray-400 uppercase">Report Name</th>
+              <th className="text-left p-3 text-xs text-gray-400 uppercase w-16">Source</th>
+              {scope === 'all' && (
+                <th className="text-left p-3 text-xs text-gray-400 uppercase w-20">Status</th>
+              )}
               <th className="text-left p-3 text-xs text-gray-400 uppercase">Owner</th>
               <th className="text-right p-3 text-xs text-gray-400 uppercase">Execs</th>
               <th className="text-right p-3 text-xs text-gray-400 uppercase">Users</th>
-              <th className="text-right p-3 text-xs text-gray-400 uppercase">M / T / F</th>
-              <th className="text-left p-3 text-xs text-gray-400 uppercase">Cluster</th>
+              <th className="text-right p-3 text-xs text-gray-400 uppercase" title="Attributes / Metrics / Tables / Filters">A / M / T / F</th>
+              <th className="text-left p-3 text-xs text-gray-400 uppercase">Role</th>
             </tr>
           </thead>
           <tbody>
             {reports.map((r) => {
               const cluster = r.clusterId ? clusterById.get(r.clusterId) : null;
+              const isPrimary = cluster?.primaryReportId === r.id;
+              const status = r.status || 'active';
+              const statusPill = {
+                active: 'bg-emerald-900/40 text-emerald-300 border-emerald-700/50',
+                retired: 'bg-red-900/40 text-red-200 border-red-700/50',
+                collapsed: 'bg-amber-900/40 text-amber-200 border-amber-700/50',
+                dossier: 'bg-purple-900/40 text-purple-200 border-purple-700/50',
+              }[status] || 'bg-gray-800/60 text-gray-300 border-gray-700/50';
               return (
                 <tr
                   key={r.id}
-                  className="border-t border-[#1e2d50] hover:bg-[#1a2a4a] text-gray-300"
+                  onClick={() => onOpenReport(r)}
+                  className="border-t border-[#1e2d50] hover:bg-[#1a2a4a] text-gray-300 cursor-pointer"
                 >
                   <td className="p-3 text-white">{r.name}</td>
+                  <td className="p-3"><SourceTypePill sourceType={r.sourceType} /></td>
+                  {scope === 'all' && (
+                    <td className="p-3">
+                      <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${statusPill}`}>
+                        {status}
+                      </span>
+                    </td>
+                  )}
                   <td className="p-3 text-xs">{r.owner || '-'}</td>
                   <td className="p-3 text-right font-mono">{r.executions.toLocaleString()}</td>
                   <td className="p-3 text-right font-mono">{r.users}</td>
                   <td className="p-3 text-right font-mono text-xs">
-                    {r.metricCount}/{r.tableCount}/{r.filterCount}
+                    {r.attributeCount ?? 0}/{r.metricCount}/{r.tableCount}/{r.filterCount}
                   </td>
                   <td className="p-3">
-                    {cluster ? (
+                    {cluster && isPrimary ? (
                       <button
-                        onClick={() => onOpenCluster(cluster)}
-                        className="text-xs text-blue-400 hover:underline"
+                        onClick={(e) => { e.stopPropagation(); onOpenCluster(cluster); }}
+                        className="text-xs text-emerald-400 hover:underline"
+                        title="Primary of this cluster — click to open"
                       >
-                        {r.clusterId} ({cluster.size})
+                        ✓ Primary of {r.clusterId} ({cluster.size})
                       </button>
+                    ) : cluster ? (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); onOpenCluster(cluster); }}
+                        className="text-xs text-amber-400 hover:underline"
+                        title="Member of this cluster (not the primary — collapsed under another report)"
+                      >
+                        Member of {r.clusterId}
+                      </button>
+                    ) : r.isFinalCanonical ? (
+                      <span className="text-xs text-emerald-400" title="Post-AST singleton that survived to final">
+                        Singleton (kept)
+                      </span>
                     ) : (
-                      <span className="text-xs text-gray-600">Singleton</span>
+                      <span className="text-xs text-gray-500" title="Not in final-kept set — likely collapsed at an earlier pipeline stage">
+                        —
+                      </span>
                     )}
                   </td>
                 </tr>
@@ -1973,6 +3443,2953 @@ function ReportsTab({
             })}
           </tbody>
         </table>
+      </div>
+
+      {/* Floating AI Assistant chat panel */}
+      {chatOpen && (
+        <AiAssistantChat
+          projectId={projectId}
+          projectName={projectName}
+          onClose={() => setChatOpen(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// AI ASSISTANT CHAT PANEL
+// ─────────────────────────────────────────────────────────────────────
+
+interface ChatTurn {
+  role: 'user' | 'assistant';
+  content: string;
+  ts: number;
+}
+
+const SUGGESTED_QUESTIONS = [
+  'How many reports survived the pipeline?',
+  'Which reports got collapsed the most?',
+  'Show me the biggest semantic cluster',
+  'How many cube-sourced reports are kept?',
+  'What are the top rationalization opportunities?',
+  'Which families have the most duplicates?',
+];
+
+function AiAssistantChat({
+  projectId,
+  projectName,
+  onClose,
+}: {
+  projectId: string;
+  projectName: string;
+  onClose: () => void;
+}) {
+  // If projectName is empty (not yet loaded), don't persist to the 'default'
+  // bucket — use a sentinel and clear when the real name arrives.
+  const effectiveKey = projectName || projectId;
+  const chatKey = effectiveKey ? `ai-assistant.history.${effectiveKey}` : 'ai-assistant.history._pending';
+  const [history, setHistory] = usePersistentState<ChatTurn[]>(chatKey, []);
+  const [input, setInput] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+
+  // If the user switches projects, the chatKey changes and this component
+  // reads history from the new localStorage slot. Make that explicit.
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
+  }, [history, busy, chatKey]);
+
+  async function send(text?: string) {
+    const q = (text ?? input).trim();
+    if (!q || busy) return;
+    setError(null);
+    const turn: ChatTurn = { role: 'user', content: q, ts: Date.now() };
+    const nextHistory = [...history, turn];
+    setHistory(nextHistory);
+    setInput('');
+    setBusy(true);
+    try {
+      const msgs = nextHistory.map((t) => ({ role: t.role, content: t.content }));
+      // Use GUID or name — backend resolves either
+      const project = projectName || projectId;
+      const res = await askAssistant(project, msgs);
+      setHistory([...nextHistory, { role: 'assistant', content: res.answer, ts: Date.now() }]);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function handleKey(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      send();
+    }
+  }
+
+  function clearHistory() {
+    if (history.length === 0 || window.confirm('Clear chat history?')) {
+      setHistory([]);
+      setError(null);
+    }
+  }
+
+  return (
+    <div className="fixed bottom-6 right-6 w-[480px] h-[620px] bg-[#16213e] border border-fuchsia-700 rounded-xl shadow-2xl flex flex-col z-40">
+      {/* Header */}
+      <div className="p-3 border-b border-fuchsia-800/60 bg-gradient-to-r from-fuchsia-950/60 to-[#16213e] rounded-t-xl flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <span className="text-xl">🤖</span>
+          <div>
+            <div className="text-sm text-white font-semibold">Rationalization Assistant</div>
+            <div className="text-[10px] text-gray-400">Scoped to <span className="text-fuchsia-300">{projectName || '(no project)'}</span></div>
+          </div>
+        </div>
+        <div className="flex gap-1">
+          <button onClick={clearHistory} className="text-[10px] text-gray-400 hover:text-white px-2 py-1"
+            title="Clear chat history">Clear</button>
+          <button onClick={onClose} className="text-gray-400 hover:text-white text-lg leading-none px-2">×</button>
+        </div>
+      </div>
+
+      {/* Messages */}
+      <div ref={scrollRef} className="flex-1 overflow-y-auto p-3 space-y-3 text-sm">
+        {history.length === 0 && (
+          <div className="space-y-3">
+            <div className="text-xs text-gray-400 leading-relaxed">
+              Ask questions about the rationalization data for <strong className="text-white">{projectName}</strong>.
+              The assistant sees summary stats, top clusters, final-kept reports, and source-type breakdowns.
+            </div>
+            <div className="text-[10px] uppercase tracking-wider text-gray-500">Try asking</div>
+            <div className="flex flex-col gap-1.5">
+              {SUGGESTED_QUESTIONS.map((q) => (
+                <button
+                  key={q}
+                  onClick={() => send(q)}
+                  disabled={busy}
+                  className="text-left text-xs text-fuchsia-300 hover:text-fuchsia-200 bg-[#0f0f1a] hover:bg-[#1a2a4a] border border-fuchsia-900/50 rounded px-3 py-2 disabled:opacity-50"
+                >
+                  {q}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        {history.map((t, i) => (
+          <div key={i} className={`flex ${t.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+            <div className={`max-w-[85%] rounded-lg px-3 py-2 text-sm leading-relaxed whitespace-pre-wrap ${
+              t.role === 'user'
+                ? 'bg-fuchsia-900/50 text-fuchsia-50 border border-fuchsia-700/50'
+                : 'bg-[#0f0f1a] text-gray-200 border border-[#1e2d50]'
+            }`}>
+              {t.content}
+            </div>
+          </div>
+        ))}
+        {busy && (
+          <div className="flex justify-start">
+            <div className="bg-[#0f0f1a] border border-[#1e2d50] rounded-lg px-3 py-2 text-xs text-gray-400 flex items-center gap-2">
+              <span className="animate-spin inline-block w-3 h-3 border-2 border-fuchsia-500 border-t-transparent rounded-full"></span>
+              thinking…
+            </div>
+          </div>
+        )}
+        {error && (
+          <div className="bg-red-950/40 border border-red-700/50 text-red-200 text-xs p-2 rounded">
+            <strong>Error:</strong> {error}
+          </div>
+        )}
+      </div>
+
+      {/* Input */}
+      <div className="p-2 border-t border-[#1e2d50]">
+        <div className="flex gap-2">
+          <textarea
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={handleKey}
+            disabled={busy}
+            placeholder={busy ? 'Waiting for response…' : 'Ask about this project (Enter to send, Shift+Enter for newline)'}
+            className="flex-1 bg-[#0f0f1a] border border-[#1e2d50] rounded px-2 py-1.5 text-sm text-white resize-none focus:outline-none focus:border-fuchsia-500"
+            rows={2}
+          />
+          <button
+            onClick={() => send()}
+            disabled={busy || !input.trim()}
+            className="bg-fuchsia-600 hover:bg-fuchsia-500 disabled:bg-fuchsia-900 disabled:text-gray-500 disabled:cursor-not-allowed text-white text-sm font-semibold px-4 rounded"
+          >
+            Send
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// REPORT DETAIL MODAL  (click from "Final Reports to Keep")
+// ─────────────────────────────────────────────────────────────────────
+
+function ReportDetailModal({
+  report,
+  clusters,
+  onClose,
+  onOpenCluster,
+}: {
+  report: ReportDetail;
+  clusters: ClusterMeta[];
+  onClose: () => void;
+  onOpenCluster: (c: ClusterMeta) => void;
+}) {
+  const cluster = useMemo(
+    () => (report.clusterId ? clusters.find((c) => c.id === report.clusterId) || null : null),
+    [report.clusterId, clusters]
+  );
+  const isPrimary = cluster?.primaryReportId === report.id;
+
+  function fmtDate(s: string | null | undefined): string {
+    if (!s) return '—';
+    try {
+      return new Date(s).toLocaleString();
+    } catch {
+      return s;
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-6"
+      onClick={onClose}
+    >
+      <div
+        className="bg-[#16213e] rounded-lg max-w-4xl w-full max-h-[92vh] overflow-hidden flex flex-col"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="p-5 border-b border-[#1e2d50] flex justify-between items-start">
+          <div className="min-w-0 flex-1">
+            <div className="text-xs text-gray-500 font-mono mb-1 break-all">{report.id}</div>
+            <h2 className="text-xl font-bold text-white">{report.name}</h2>
+            <div className="text-xs text-gray-400 mt-2 flex items-center gap-3 flex-wrap">
+              {isPrimary && cluster && (
+                <span className="text-xs font-semibold bg-emerald-900/50 text-emerald-300 border border-emerald-700/50 px-2 py-0.5 rounded">
+                  Primary of cluster {cluster.id} ({cluster.size} members)
+                </span>
+              )}
+              {!cluster && (
+                <span className="text-xs font-semibold bg-slate-800/60 text-slate-300 border border-slate-600/50 px-2 py-0.5 rounded">
+                  Post-AST singleton — no similarity pair ≥ 0.80
+                </span>
+              )}
+              <span className="flex items-center gap-1.5" title="Report source type">
+                <span className="text-gray-500 text-[10px]">SOURCE:</span>
+                <SourceTypePill sourceType={report.sourceType} />
+              </span>
+              {report.sql ? (
+                <span className="text-xs font-semibold bg-emerald-900/50 text-emerald-300 border border-emerald-700/50 px-2 py-0.5 rounded">
+                  ✓ SQL extracted
+                </span>
+              ) : (
+                <span className="text-xs font-semibold bg-gray-800/60 text-gray-400 border border-gray-700/50 px-2 py-0.5 rounded">
+                  — no SQL
+                </span>
+              )}
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            className="text-gray-400 hover:text-white text-2xl leading-none flex-shrink-0 ml-3"
+          >
+            ×
+          </button>
+        </div>
+
+        <div className="p-5 overflow-y-auto flex-1 space-y-5">
+          {/* Core attributes */}
+          <div className="grid grid-cols-2 gap-4 text-sm">
+            <div>
+              <div className="text-xs text-gray-400 uppercase mb-1">Owner</div>
+              <div className="text-gray-200">{report.owner || '—'}</div>
+            </div>
+            <div>
+              <div className="text-xs text-gray-400 uppercase mb-1">Match Tier</div>
+              <div className="text-gray-200">{report.matchTier || '—'}</div>
+            </div>
+            <div className="col-span-2">
+              <div className="text-xs text-gray-400 uppercase mb-1">Path</div>
+              <div className="text-gray-200 text-xs font-mono break-all">{report.path || '—'}</div>
+            </div>
+            <div>
+              <div className="text-xs text-gray-400 uppercase mb-1">Family Base</div>
+              <div className="text-gray-200">{report.familyBase || '—'}</div>
+            </div>
+            <div>
+              <div className="text-xs text-gray-400 uppercase mb-1">Cluster</div>
+              {cluster ? (
+                <button
+                  onClick={() => onOpenCluster(cluster)}
+                  className="text-blue-400 hover:underline text-sm"
+                >
+                  {cluster.id} — open ({cluster.size} members)
+                </button>
+              ) : (
+                <span className="text-gray-500">Singleton</span>
+              )}
+            </div>
+          </div>
+
+          {/* Usage */}
+          <div>
+            <div className="text-xs text-gray-400 uppercase mb-2">Usage</div>
+            <div className="grid grid-cols-3 gap-4">
+              <div className="bg-[#0f0f1a] p-3 rounded border border-[#1e2d50]">
+                <div className="text-xs text-gray-500">Executions</div>
+                <div className="text-lg font-bold text-white">
+                  {report.executions.toLocaleString()}
+                </div>
+              </div>
+              <div className="bg-[#0f0f1a] p-3 rounded border border-[#1e2d50]">
+                <div className="text-xs text-gray-500">Users</div>
+                <div className="text-lg font-bold text-white">{report.users}</div>
+              </div>
+              <div className="bg-[#0f0f1a] p-3 rounded border border-[#1e2d50]">
+                <div className="text-xs text-gray-500">Last Execution</div>
+                <div className="text-sm text-gray-200 mt-1">{report.lastExec || '—'}</div>
+              </div>
+            </div>
+          </div>
+
+          {/* Lineage */}
+          <div className="grid grid-cols-2 gap-4 text-sm">
+            <div>
+              <div className="text-xs text-gray-400 uppercase mb-1">Created</div>
+              <div className="text-gray-200">{fmtDate(report.dateCreated)}</div>
+            </div>
+            <div>
+              <div className="text-xs text-gray-400 uppercase mb-1">Modified</div>
+              <div className="text-gray-200">{fmtDate(report.dateModified)}</div>
+            </div>
+          </div>
+
+          {/* Feature sets */}
+          <div className="space-y-3">
+            <FeatureBlock title="Attributes" items={report.attributes || []} color="bg-amber-900 text-amber-200" />
+            <FeatureBlock title="Metrics" items={report.metrics} color="bg-blue-900 text-blue-200" />
+            <FeatureBlock title="Tables" items={report.tables} color="bg-emerald-900 text-emerald-200" />
+            <FeatureBlock title="Filter Attributes" items={report.filters} color="bg-purple-900 text-purple-200" />
+          </div>
+
+          {/* SQL */}
+          <div>
+            <div className="text-xs text-gray-400 uppercase mb-2 flex items-center justify-between">
+              <span>Extracted SQL</span>
+              {report.sql && (
+                <span className="text-gray-500">{report.sql.length.toLocaleString()} chars</span>
+              )}
+            </div>
+            {report.sql ? (
+              <pre className="bg-[#0f0f1a] border border-[#1e2d50] rounded p-3 text-xs text-gray-300 font-mono overflow-auto max-h-[40vh]">
+                {report.sql}
+              </pre>
+            ) : (
+              <div className="bg-[#0f0f1a] border border-[#1e2d50] rounded p-3 text-xs text-gray-500">
+                No SQL available. {report.sqlError ? `Error: ${report.sqlError}` : 'Likely a cube-sourced or prompted report.'}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Compact pill renderer for report source_type. Values from MSTR inventory:
+//   "normal"               → SQL (warehouse-sourced)
+//   "cube"                 → Cube (Intelligent Cube feed)
+//   "custom_sql_free_form" → Free SQL (custom SQL report)
+//   ""                     → ? (source unknown / not captured)
+const SOURCE_TYPE_LABEL: Record<string, { short: string; tip: string; cls: string }> = {
+  normal: {
+    short: 'SQL',
+    tip: 'Warehouse-sourced — generates SQL against the underlying DB',
+    cls: 'bg-blue-900/50 text-blue-200 border border-blue-700/50',
+  },
+  cube: {
+    short: 'Cube',
+    tip: 'Intelligent Cube feed — reads from a pre-aggregated in-memory cube, no DB SQL',
+    cls: 'bg-purple-900/50 text-purple-200 border border-purple-700/50',
+  },
+  custom_sql_free_form: {
+    short: 'Free SQL',
+    tip: 'Free-form custom SQL report — hand-written query',
+    cls: 'bg-amber-900/40 text-amber-200 border border-amber-700/50',
+  },
+};
+
+// Plain-English label for cluster data quality. When >80% of members have
+// no captured metadata, a "cluster" isn't really a cluster — it's a bucket
+// of reports we know nothing about. Don't pretend it's a rationalization
+// target; label it honestly so business users don't act on it.
+function DataQualityBadge({ cluster }: {
+  cluster: { dataQuality?: string | null; dataQualityReason?: string | null; emptyMemberCount?: number; size?: number };
+}) {
+  const q = cluster.dataQuality;
+  const reason = cluster.dataQualityReason;
+  const empty = cluster.emptyMemberCount ?? 0;
+  const size = cluster.size ?? 0;
+  if (!q || q === 'high') return null;
+  const pct = size > 0 ? Math.round((empty / size) * 100) : 0;
+  if (q === 'low' && reason === 'empty_features') {
+    return (
+      <span
+        className="text-[10px] font-semibold px-2 py-0.5 rounded bg-amber-900/50 text-amber-200 border border-amber-700/50"
+        title={`${empty} of ${size} members (${pct}%) have NO captured metadata — no metrics, no tables, no filters, no attributes. These reports were grouped because their feature sets are identical (empty). This is a data-quality issue, not a real similarity cluster — their inventory extraction likely failed.`}
+      >
+        ⚠ We know nothing about {pct}% of these reports
+      </span>
+    );
+  }
+  if (q === 'low' && reason === 'sparse_features') {
+    return (
+      <span
+        className="text-[10px] font-semibold px-2 py-0.5 rounded bg-amber-900/40 text-amber-200 border border-amber-700/40"
+        title={`${empty} of ${size} members (${pct}%) have fewer than 3 features captured. Cluster similarity is weak signal — treat with caution.`}
+      >
+        ⚠ Weak signal ({pct}% have &lt;3 features)
+      </span>
+    );
+  }
+  if (q === 'mixed') {
+    return (
+      <span
+        className="text-[10px] font-semibold px-2 py-0.5 rounded bg-yellow-900/30 text-yellow-200 border border-yellow-700/40"
+        title={`${empty} of ${size} members (${pct}%) have no captured metadata. The cluster mixes real and unknown reports.`}
+      >
+        ⚠ Mixed quality ({pct}% unknown)
+      </span>
+    );
+  }
+  return null;
+}
+
+function SourceTypePill({ sourceType }: { sourceType: string | null | undefined }) {
+  const key = (sourceType || '').trim();
+  const meta = SOURCE_TYPE_LABEL[key];
+  if (!meta) {
+    return (
+      <span
+        className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-gray-700/50 bg-gray-800/60 text-gray-500"
+        title={key ? `source_type=${key}` : 'source type not captured'}
+      >
+        ?
+      </span>
+    );
+  }
+  return (
+    <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${meta.cls}`} title={meta.tip}>
+      {meta.short}
+    </span>
+  );
+}
+
+// Compact indicator showing the collapsed family siblings behind a canonical.
+// Clicks toggle a popover listing each sibling with its variant suffix +
+// status + executions. Absent or zero-sibling reports render nothing.
+function FamilySiblingsIndicator({
+  siblings,
+}: {
+  siblings: FamilyCollapsedSibling[] | undefined;
+}) {
+  const [open, setOpen] = useState(false);
+  if (!siblings || siblings.length === 0) return null;
+  const titleText = `This canonical stands for ${siblings.length} family-collapsed sibling${siblings.length === 1 ? '' : 's'} — dated/variant saves of the same report that were merged away at the Family stage.`;
+  return (
+    <span className="relative inline-block">
+      <button
+        type="button"
+        onClick={(e) => { e.stopPropagation(); setOpen((v) => !v); }}
+        className="text-[9px] font-semibold text-indigo-200 bg-indigo-950/60 border border-indigo-700/60 hover:bg-indigo-900/60 rounded px-1.5 py-0.5 whitespace-nowrap cursor-pointer"
+        title={titleText}
+      >
+        ⚑ +{siblings.length} sib{siblings.length === 1 ? '' : 's'}
+      </button>
+      {open && (
+        <div
+          className="absolute z-20 left-0 mt-1 w-96 max-h-72 overflow-y-auto bg-[#0f0f1a] border border-indigo-700/60 rounded shadow-lg p-2 text-[11px]"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="text-indigo-200 font-semibold mb-1">
+            {siblings.length} family-collapsed sibling{siblings.length === 1 ? '' : 's'}:
+          </div>
+          <div className="text-[10px] text-gray-500 mb-1.5 leading-snug">
+            These reports share the same family name as the canonical and were
+            merged into it by the Family stage. They're not in Jaccard/Semantic
+            clusters themselves — this canonical represents the whole group.
+          </div>
+          <table className="w-full">
+            <thead>
+              <tr className="text-[9px] text-gray-500 uppercase">
+                <th className="text-left py-1">Variant</th>
+                <th className="text-left py-1">Status</th>
+                <th className="text-right py-1">Execs</th>
+              </tr>
+            </thead>
+            <tbody>
+              {siblings.map((s) => (
+                <tr key={s.id} className="border-t border-[#1e2d50]">
+                  <td className="py-0.5 text-gray-200 truncate max-w-[16rem]" title={s.name}>
+                    {s.suffix || s.name}
+                  </td>
+                  <td className="py-0.5">
+                    <span className={`text-[9px] font-semibold px-1 py-0.5 rounded ${
+                      s.status === 'active' ? 'text-emerald-300 bg-emerald-900/30 border border-emerald-800/50' :
+                      s.status === 'retired' ? 'text-gray-400 bg-gray-800/40 border border-gray-700/50' :
+                      'text-amber-300 bg-amber-900/30 border border-amber-800/50'
+                    }`}>
+                      {s.status || '?'}
+                    </span>
+                  </td>
+                  <td className="py-0.5 text-right font-mono text-gray-400">
+                    {s.executions.toLocaleString()}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); setOpen(false); }}
+            className="mt-2 text-[10px] text-gray-500 hover:text-white">
+            close
+          </button>
+        </div>
+      )}
+    </span>
+  );
+}
+
+function FeatureBlock({
+  title,
+  items,
+  color,
+}: {
+  title: string;
+  items: string[];
+  color: string;
+}) {
+  return (
+    <div>
+      <div className="text-xs text-gray-400 uppercase mb-2">
+        {title} <span className="text-gray-600">({items.length})</span>
+      </div>
+      {items.length === 0 ? (
+        <div className="text-xs text-gray-600">—</div>
+      ) : (
+        <div className="flex flex-wrap gap-1">
+          {items.map((it, i) => (
+            <span key={i} className={`text-xs px-2 py-0.5 rounded ${color}`}>
+              {it}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// JACCARD vs SEMANTIC COMPARISON TAB
+// ─────────────────────────────────────────────────────────────────────
+
+const COMPARISON_CATEGORY_STYLES: Record<ClusterComparisonCategory, {
+  label: string; desc: string; border: string; bg: string; text: string;
+}> = {
+  both: {
+    label: 'In Both',
+    desc: 'Methods agree — report clustered by both Jaccard & Semantic',
+    border: 'border-emerald-500',
+    bg: 'bg-emerald-900/30',
+    text: 'text-emerald-300',
+  },
+  jaccardOnly: {
+    label: 'Jaccard Only',
+    desc: 'Jaccard found peers; Semantic treated it as a singleton',
+    border: 'border-blue-500',
+    bg: 'bg-blue-900/30',
+    text: 'text-blue-300',
+  },
+  semanticOnly: {
+    label: 'Semantic Only',
+    desc: 'Semantic found peers (synonym drift); Jaccard missed — key added value of embeddings',
+    border: 'border-teal-500',
+    bg: 'bg-teal-900/30',
+    text: 'text-teal-300',
+  },
+  neither: {
+    label: 'Singleton in Both',
+    desc: 'Neither method found peers — truly unique reports',
+    border: 'border-slate-500',
+    bg: 'bg-slate-800/60',
+    text: 'text-slate-300',
+  },
+};
+
+function ClusterComparisonTab({
+  data,
+  category,
+  setCategory,
+  search,
+  setSearch,
+}: {
+  data: ClusterComparison | null;
+  category: 'all' | ClusterComparisonCategory;
+  setCategory: (v: 'all' | ClusterComparisonCategory) => void;
+  search: string;
+  setSearch: (v: string) => void;
+}) {
+  const filtered = useMemo(() => {
+    if (!data) return [];
+    let list = data.reports;
+    if (category !== 'all') list = list.filter((r) => r.category === category);
+    const q = search.toLowerCase().trim();
+    if (q) {
+      list = list.filter(
+        (r) =>
+          r.name.toLowerCase().includes(q) ||
+          (r.owner && r.owner.toLowerCase().includes(q)) ||
+          (r.semanticLabel && r.semanticLabel.toLowerCase().includes(q)) ||
+          (r.jaccardClusterId && r.jaccardClusterId.toLowerCase().includes(q)) ||
+          (r.semanticClusterId && r.semanticClusterId.toLowerCase().includes(q))
+      );
+    }
+    return list.slice(0, 2000);
+  }, [data, category, search]);
+
+  if (!data) {
+    return (
+      <div className="bg-[#16213e] p-8 rounded-lg text-center space-y-3">
+        <div className="text-4xl">⚖️</div>
+        <h2 className="text-xl font-bold text-white">No comparison data yet</h2>
+        <p className="text-sm text-gray-400 max-w-2xl mx-auto">
+          Run both Jaccard and Semantic clustering, then re-emit JSON to populate this view.
+        </p>
+      </div>
+    );
+  }
+
+  const s = data.stats;
+  const categories: Array<ClusterComparisonCategory> = ['both', 'semanticOnly', 'jaccardOnly', 'neither'];
+
+  return (
+    <div className="space-y-4">
+      {/* Intro */}
+      <div className="bg-gradient-to-r from-indigo-950/60 to-[#16213e] p-4 rounded-lg border border-indigo-800/40">
+        <div className="text-xs uppercase tracking-wider text-indigo-300 font-bold mb-2">
+          Jaccard vs Semantic — Per-Report Comparison
+        </div>
+        <p className="text-xs text-gray-400 leading-relaxed">
+          Both clustering methods run on the same{' '}
+          <strong className="text-white">{data.postAstTotal.toLocaleString()}</strong> post-AST
+          canonicals. This tab partitions each report by which method (if any) clustered it,
+          so you can see where the two agree, where they disagree, and which reports are truly
+          unique. "Semantic Only" highlights the synonym-drift cases that Jaccard's lexical
+          overlap misses.
+        </p>
+      </div>
+
+      {/* Summary boxes */}
+      <div className="grid grid-cols-4 gap-3">
+        {categories.map((c) => {
+          const st = COMPARISON_CATEGORY_STYLES[c];
+          const n = s[c];
+          const selected = category === c;
+          return (
+            <button
+              key={c}
+              onClick={() => setCategory(selected ? 'all' : c)}
+              className={`text-left p-4 rounded-lg border-l-4 ${st.border} ${selected ? st.bg + ' ring-2 ring-white/20' : 'bg-[#0f0f1a] hover:bg-[#1a2a4a]'} transition-colors`}
+              title={st.desc}
+            >
+              <div className={`text-[10px] uppercase tracking-wider font-bold ${st.text}`}>
+                {st.label}
+              </div>
+              <div className="text-2xl font-bold text-white mt-1">{n.toLocaleString()}</div>
+              <div className="text-[10px] text-gray-500 mt-1">
+                {((100 * n) / Math.max(1, data.postAstTotal)).toFixed(0)}% of post-AST
+              </div>
+              <div className="text-[10px] text-gray-500 mt-1 line-clamp-2">{st.desc}</div>
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Search + filter controls */}
+      <div className="bg-[#16213e] p-4 rounded-lg">
+        <div className="flex gap-3 items-center flex-wrap">
+          <button
+            onClick={() => setCategory('all')}
+            className={`text-xs px-3 py-1 rounded border ${
+              category === 'all'
+                ? 'bg-blue-600 text-white border-blue-500'
+                : 'bg-[#0f0f1a] text-gray-400 border-[#1e2d50]'
+            }`}
+          >
+            All ({data.reports.length})
+          </button>
+          {categories.map((c) => {
+            const st = COMPARISON_CATEGORY_STYLES[c];
+            return (
+              <button
+                key={c}
+                onClick={() => setCategory(category === c ? 'all' : c)}
+                className={`text-xs px-3 py-1 rounded border ${
+                  category === c
+                    ? st.bg + ' ' + st.text + ' ' + st.border
+                    : 'bg-[#0f0f1a] text-gray-400 border-[#1e2d50]'
+                }`}
+              >
+                {st.label} ({s[c]})
+              </button>
+            );
+          })}
+        </div>
+        <div className="relative mt-3">
+          <VscSearch className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" />
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search by name, owner, cluster ID, or semantic label..."
+            className="w-full bg-[#0f0f1a] border border-[#1e2d50] rounded-lg pl-10 pr-4 py-2.5 text-white text-sm focus:outline-none focus:border-blue-500"
+          />
+        </div>
+      </div>
+
+      <div className="bg-[#16213e] rounded-lg overflow-hidden">
+        <div className="px-4 py-3 border-b border-[#1e2d50] text-sm text-gray-400">
+          <span className="font-semibold text-white">{filtered.length.toLocaleString()}</span>
+          {filtered.length === 2000 ? ' shown (capped)' : ''} reports
+        </div>
+        <div className="max-h-[65vh] overflow-y-auto">
+          <table className="w-full text-sm">
+            <thead className="bg-[#0f0f1a] sticky top-0">
+              <tr>
+                <th className="text-left p-3 text-xs text-gray-400 uppercase">Report Name</th>
+                <th className="text-right p-3 text-xs text-gray-400 uppercase">Execs</th>
+                <th className="text-left p-3 text-xs text-gray-400 uppercase">Category</th>
+                <th className="text-left p-3 text-xs text-gray-400 uppercase">Jaccard cluster</th>
+                <th className="text-left p-3 text-xs text-gray-400 uppercase">Semantic cluster</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((r) => {
+                const st = COMPARISON_CATEGORY_STYLES[r.category];
+                return (
+                  <tr key={r.id} className="border-t border-[#1e2d50] text-gray-300 hover:bg-[#1a2a4a]">
+                    <td className="p-3 text-white">
+                      {r.name}
+                      {r.owner && (
+                        <div className="text-[11px] text-gray-500">{r.owner}</div>
+                      )}
+                    </td>
+                    <td className="p-3 text-right font-mono text-gray-400">
+                      {r.executions.toLocaleString()}
+                    </td>
+                    <td className="p-3">
+                      <span className={`text-xs px-2 py-0.5 rounded border ${st.bg} ${st.text} ${st.border.replace('border-', 'border-')}`}>
+                        {st.label}
+                      </span>
+                    </td>
+                    <td className="p-3">
+                      {r.jaccardClusterId ? (
+                        <span className="text-xs font-mono text-blue-300">
+                          {r.jaccardClusterId}
+                          <span className="text-gray-500 ml-1">({r.jaccardClusterSize})</span>
+                        </span>
+                      ) : (
+                        <span className="text-xs text-gray-600">—</span>
+                      )}
+                    </td>
+                    <td className="p-3">
+                      {r.semanticClusterId ? (
+                        <div>
+                          <span className="text-xs font-mono text-teal-300">
+                            {r.semanticClusterId}
+                            <span className="text-gray-500 ml-1">({r.semanticClusterSize})</span>
+                          </span>
+                          {r.semanticLabel && (
+                            <div className="text-[11px] text-gray-400 mt-0.5 line-clamp-1">
+                              {r.semanticLabel}
+                            </div>
+                          )}
+                        </div>
+                      ) : (
+                        <span className="text-xs text-gray-600">—</span>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// HEAVY USERS TAB
+// ─────────────────────────────────────────────────────────────────────
+
+function HeavyUsersTab({
+  users,
+  search,
+  setSearch,
+  showService,
+  setShowService,
+  onOpen,
+}: {
+  users: HeavyUser[];
+  search: string;
+  setSearch: (v: string) => void;
+  showService: boolean;
+  setShowService: (v: boolean) => void;
+  onOpen: (u: HeavyUser) => void;
+}) {
+  const filtered = useMemo(() => {
+    let list = users;
+    if (!showService) list = list.filter((u) => !u.isService);
+    const q = search.toLowerCase().trim();
+    if (q) list = list.filter((u) => u.user.toLowerCase().includes(q));
+    return list;
+  }, [users, showService, search]);
+
+  const humanTotalExecs = useMemo(
+    () => users.filter((u) => !u.isService).reduce((s, u) => s + u.totalExecutions, 0),
+    [users]
+  );
+  const serviceTotalExecs = useMemo(
+    () => users.filter((u) => u.isService).reduce((s, u) => s + u.totalExecutions, 0),
+    [users]
+  );
+  const serviceCount = users.filter((u) => u.isService).length;
+
+  if (users.length === 0) {
+    return (
+      <div className="bg-[#16213e] p-8 rounded-lg text-center space-y-3">
+        <div className="text-4xl">👥</div>
+        <h2 className="text-xl font-bold text-white">No user activity data yet</h2>
+        <p className="text-sm text-gray-400 max-w-2xl mx-auto">
+          Populate <code className="text-emerald-300">UserActivity.csv</code> and re-run the
+          build to see who drives report executions.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* Intro + stats */}
+      <div className="bg-gradient-to-r from-blue-950/60 to-[#16213e] p-4 rounded-lg border border-blue-800/40">
+        <div className="text-xs uppercase tracking-wider text-blue-300 font-bold mb-2">
+          Heavy Users — Who Actually Drives Report Execution in This Project
+        </div>
+        <p className="text-xs text-gray-400 leading-relaxed">
+          Top users by execution count against reports in this project (scoped by folder-path prefix).
+          Click any user to see their top reports, whether those reports survived the pipeline as
+          final canonicals, and whether they're singletons, cluster members, or non-inventory
+          objects (dossiers, deleted items, project meta-objects).
+        </p>
+      </div>
+
+      <div className="grid grid-cols-4 gap-4">
+        <div className="bg-[#16213e] p-4 rounded-lg border-l-4 border-blue-500">
+          <div className="text-xs text-gray-400 uppercase mb-1">Users (human)</div>
+          <div className="text-2xl font-bold text-white">
+            {(users.length - serviceCount).toLocaleString()}
+          </div>
+        </div>
+        <div className="bg-[#16213e] p-4 rounded-lg border-l-4 border-amber-500">
+          <div className="text-xs text-gray-400 uppercase mb-1">Users (service)</div>
+          <div className="text-2xl font-bold text-white">{serviceCount}</div>
+          <div className="text-xs text-gray-500">flagged by name heuristic</div>
+        </div>
+        <div className="bg-[#16213e] p-4 rounded-lg border-l-4 border-emerald-500">
+          <div className="text-xs text-gray-400 uppercase mb-1">Human executions</div>
+          <div className="text-2xl font-bold text-white">{humanTotalExecs.toLocaleString()}</div>
+        </div>
+        <div className="bg-[#16213e] p-4 rounded-lg border-l-4 border-slate-500">
+          <div className="text-xs text-gray-400 uppercase mb-1">Service executions</div>
+          <div className="text-2xl font-bold text-white">{serviceTotalExecs.toLocaleString()}</div>
+        </div>
+      </div>
+
+      <div className="bg-[#16213e] p-4 rounded-lg">
+        <div className="flex gap-3 items-center mb-3">
+          <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={showService}
+              onChange={(e) => setShowService(e.target.checked)}
+              className="accent-amber-500"
+            />
+            <span>Show service accounts (ODS_PROD, dataiku, Administrator, …)</span>
+          </label>
+        </div>
+        <div className="relative">
+          <VscSearch className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" />
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search by user name..."
+            className="w-full bg-[#0f0f1a] border border-[#1e2d50] rounded-lg pl-10 pr-4 py-2.5 text-white text-sm focus:outline-none focus:border-blue-500"
+          />
+        </div>
+      </div>
+
+      <div className="bg-[#16213e] rounded-lg overflow-hidden">
+        <div className="px-4 py-3 border-b border-[#1e2d50] text-sm text-gray-400">
+          <span className="font-semibold text-white">{filtered.length.toLocaleString()}</span>
+          {' '}users shown. Click a row for details.
+        </div>
+        <div className="max-h-[70vh] overflow-y-auto">
+          <table className="w-full text-sm">
+            <thead className="bg-[#0f0f1a] sticky top-0">
+              <tr>
+                <th className="text-left p-3 text-xs text-gray-400 uppercase">User</th>
+                <th className="text-right p-3 text-xs text-gray-400 uppercase">Executions</th>
+                <th className="text-right p-3 text-xs text-gray-400 uppercase">Unique Reports</th>
+                <th className="text-right p-3 text-xs text-gray-400 uppercase">Sessions</th>
+                <th className="text-right p-3 text-xs text-gray-400 uppercase">Errors</th>
+                <th className="text-left p-3 text-xs text-gray-400 uppercase">Last Activity</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((u) => (
+                <tr
+                  key={u.user}
+                  onClick={() => onOpen(u)}
+                  className={`border-t border-[#1e2d50] cursor-pointer hover:bg-[#1a2a4a] ${
+                    u.isService ? 'bg-amber-900/10' : ''
+                  }`}
+                >
+                  <td className="p-3 text-white">
+                    <div className="flex items-center gap-2">
+                      <span>{u.user}</span>
+                      {u.isService && (
+                        <span className="text-[10px] font-bold bg-amber-900/50 text-amber-300 border border-amber-700/50 px-1.5 py-0.5 rounded">
+                          SERVICE
+                        </span>
+                      )}
+                    </div>
+                  </td>
+                  <td className="p-3 text-right font-mono text-gray-200">
+                    {u.totalExecutions.toLocaleString()}
+                  </td>
+                  <td className="p-3 text-right font-mono text-gray-300">
+                    {u.uniqueReports.toLocaleString()}
+                  </td>
+                  <td className="p-3 text-right font-mono text-gray-400">
+                    {(u.sessions || 0).toLocaleString()}
+                  </td>
+                  <td className={`p-3 text-right font-mono ${u.errors > 0 ? 'text-red-400' : 'text-gray-500'}`}>
+                    {(u.errors || 0).toLocaleString()}
+                  </td>
+                  <td className="p-3 text-xs text-gray-400">{u.lastExec || '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function HeavyUserModal({
+  user,
+  onClose,
+}: {
+  user: HeavyUser;
+  onClose: () => void;
+}) {
+  const stats = useMemo(() => {
+    const reports = user.topReports;
+    const inInv = reports.filter((r) => r.inInventory).length;
+    const kept = reports.filter((r) => r.isFinalCanonical).length;
+    const nonInv = reports.filter((r) => !r.inInventory).length;
+    const collapsed = reports.filter((r) => r.inInventory && r.status === 'collapsed').length;
+    return { inInv, kept, nonInv, collapsed };
+  }, [user]);
+
+  return (
+    <div
+      className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-6"
+      onClick={onClose}
+    >
+      <div
+        className="bg-[#16213e] rounded-lg max-w-5xl w-full max-h-[92vh] overflow-hidden flex flex-col"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="p-5 border-b border-[#1e2d50] flex justify-between items-start">
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2 mb-1">
+              <h2 className="text-xl font-bold text-white">{user.user}</h2>
+              {user.isService && (
+                <span className="text-xs font-bold bg-amber-900/50 text-amber-300 border border-amber-700/50 px-2 py-0.5 rounded">
+                  SERVICE ACCOUNT
+                </span>
+              )}
+            </div>
+            <div className="text-xs text-gray-400 flex items-center gap-4 flex-wrap">
+              <span>
+                <strong className="text-white">{user.totalExecutions.toLocaleString()}</strong> executions
+              </span>
+              <span>
+                <strong className="text-white">{user.uniqueReports.toLocaleString()}</strong> unique reports
+              </span>
+              <span>
+                <strong className="text-white">{(user.sessions || 0).toLocaleString()}</strong> sessions
+              </span>
+              {user.errors > 0 && (
+                <span className="text-red-400">
+                  <strong>{user.errors.toLocaleString()}</strong> errors
+                </span>
+              )}
+              <span>Last: {user.lastExec || '—'}</span>
+            </div>
+          </div>
+          <button onClick={onClose} className="text-gray-400 hover:text-white text-2xl leading-none ml-3">
+            ×
+          </button>
+        </div>
+
+        <div className="p-5 overflow-y-auto flex-1 space-y-4">
+          <div className="grid grid-cols-4 gap-3">
+            <div className="bg-[#0f0f1a] p-3 rounded border border-[#1e2d50]">
+              <div className="text-xs text-gray-500">In inventory</div>
+              <div className="text-xl font-bold text-emerald-400">{stats.inInv}</div>
+            </div>
+            <div className="bg-[#0f0f1a] p-3 rounded border border-[#1e2d50]">
+              <div className="text-xs text-gray-500">Kept as final</div>
+              <div className="text-xl font-bold text-emerald-300">{stats.kept}</div>
+            </div>
+            <div className="bg-[#0f0f1a] p-3 rounded border border-[#1e2d50]">
+              <div className="text-xs text-gray-500">Collapsed</div>
+              <div className="text-xl font-bold text-amber-400">{stats.collapsed}</div>
+            </div>
+            <div className="bg-[#0f0f1a] p-3 rounded border border-[#1e2d50]">
+              <div className="text-xs text-gray-500">Not in inventory</div>
+              <div className="text-xl font-bold text-red-400">{stats.nonInv}</div>
+              <div className="text-[10px] text-gray-500">dossier / deleted / meta</div>
+            </div>
+          </div>
+
+          <div className="text-xs text-gray-400 uppercase">Top reports this user runs</div>
+          <table className="w-full text-sm">
+            <thead className="bg-[#0f0f1a]">
+              <tr>
+                <th className="text-left p-2 text-xs text-gray-400 uppercase">Report Name</th>
+                <th className="text-right p-2 text-xs text-gray-400 uppercase">Execs</th>
+                <th className="text-left p-2 text-xs text-gray-400 uppercase">Status</th>
+                <th className="text-left p-2 text-xs text-gray-400 uppercase">Final?</th>
+              </tr>
+            </thead>
+            <tbody>
+              {user.topReports.map((r) => {
+                const statusLabel = r.inInventory
+                  ? (r.isFinalCanonical
+                      ? 'kept as canonical'
+                      : r.status === 'collapsed'
+                      ? 'collapsed'
+                      : r.clusterId
+                      ? `cluster ${r.clusterId} member`
+                      : r.status || 'active')
+                  : 'not in inventory';
+                const statusClass = r.isFinalCanonical
+                  ? 'bg-emerald-900/50 text-emerald-300 border-emerald-700/50'
+                  : !r.inInventory
+                  ? 'bg-red-900/40 text-red-200 border-red-700/50'
+                  : r.status === 'collapsed'
+                  ? 'bg-amber-900/40 text-amber-200 border-amber-700/50'
+                  : 'bg-slate-800/60 text-slate-300 border-slate-600/50';
+                return (
+                  <tr key={r.objectId} className="border-t border-[#1e2d50] text-gray-300">
+                    <td className="p-2 text-white">
+                      {r.reportName || r.inventoryName || '(unnamed)'}
+                      {r.folderPath && (
+                        <div className="text-[10px] text-gray-500 font-mono truncate max-w-[40vw]">
+                          {r.folderPath}
+                        </div>
+                      )}
+                    </td>
+                    <td className="p-2 text-right font-mono">{r.executions.toLocaleString()}</td>
+                    <td className="p-2">
+                      <span className={`text-xs px-2 py-0.5 rounded border ${statusClass}`}>
+                        {statusLabel}
+                      </span>
+                    </td>
+                    <td className="p-2 text-xs">
+                      {r.isFinalCanonical ? (
+                        <span className="text-emerald-400">✓ in Final</span>
+                      ) : (
+                        <span className="text-gray-600">—</span>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// AI PLAYGROUND TAB
+// ─────────────────────────────────────────────────────────────────────
+
+// Map a project display name to the short project_id used throughout the
+// backend (stored on experiments as config.project). Drives experiment-list
+// filtering — without this, the UI's MSTR GUID (E77B77...) would never match
+// the stored short id (global-operational).
+const PROJECT_NAME_TO_SHORT: Record<string, string> = {
+  'Global Operational': 'global-operational',
+  'Global Insight': 'global-insight',
+  'INSIGHT': 'insight',
+};
+
+function AiPlaygroundTab({ projectId, projectName, reportById, onActiveChanged }: { projectId: string; projectName: string; reportById: Map<string, ReportDetail>; onActiveChanged?: () => void }) {
+  // Which cluster (if any) is expanded in the results pane
+  const [selectedClusterId, setSelectedClusterId] = useState<string | null>(null);
+  // Scope toggle — filter experiments to this project or show all
+  const [showAllProjects, setShowAllProjects] = usePersistentState<boolean>('ai-playground.showAllProjects', false);
+  // ===== Persistent form config (localStorage-backed, survives reload) =====
+  const [formConfig, setFormConfig] = usePersistentState<{
+    expName: string; scope: string; sourceFilter: string;
+    model: string; dim: number; threshold: number;
+    minSize: number; limit: number | null;
+    fields: Record<string, boolean | number>;
+  }>('ai-playground.form.v2', {
+    expName: 'my-experiment',
+    scope: 'post-family',
+    sourceFilter: 'all',
+    model: 'text-embedding-3-large',
+    dim: 3072,
+    threshold: 0.85,
+    minSize: 2,
+    limit: null,
+    fields: {
+      name: true, path: true, owner: false,
+      attributes: true, metrics: true, tables: true, filters: true,
+      sql: true, normalizeSql: true, maxSqlChars: 2000,
+    },
+  });
+  const patchForm = (patch: Partial<typeof formConfig>) => setFormConfig((f) => ({ ...f, ...patch }));
+  const { expName, scope, sourceFilter, model, dim, threshold, minSize, limit, fields } = formConfig;
+
+  // Persist selection + active run so tab switches restore immediately.
+  const [selectedExpId, setSelectedExpId] = usePersistentState<string | null>('ai-playground.selectedExpId', null);
+  const [activeTaskId, setActiveTaskId] = usePersistentState<string | null>('ai-playground.activeTaskId', null);
+
+  // Ephemeral UI state (safe to reset on unmount — we recover from the above)
+  const [selectedExp, setSelectedExp] = useState<PlaygroundExperiment | null>(null);
+  const [experiments, setExperiments] = useState<PlaygroundExperimentIndexEntry[]>([]);
+  const [activeTask, setActiveTask] = useState<PlaygroundTask | null>(null);
+  const [loadingList, setLoadingList] = useState(false);
+  const [runError, setRunError] = useState<string | null>(null);
+  const [runStartedAt, setRunStartedAt] = useState<number | null>(null);
+  const [sidecarOk, setSidecarOk] = useState<boolean | null>(null);
+  const [apiKeySet, setApiKeySet] = useState<boolean | null>(null);
+  const pollRef = useRef<number | null>(null);
+
+  // Auto-increment a trailing number in an experiment name so users can
+  // iterate without retyping. "Experiment GO - 01" → "Experiment GO - 02",
+  // "my-experiment" → "my-experiment-2", "test-5" → "test-6".
+  function nextExperimentName(name: string): string {
+    const trimmed = (name || '').trimEnd();
+    // Match a trailing number (possibly zero-padded), preserving any
+    // separator (space, dash, colon) before it.
+    const m = trimmed.match(/^(.*?)(\d+)$/);
+    if (m) {
+      const prefix = m[1];
+      const numStr = m[2];
+      const next = parseInt(numStr, 10) + 1;
+      const padded = String(next).padStart(numStr.length, '0');
+      return prefix + padded;
+    }
+    // Otherwise append " -2" or "-2" style
+    return trimmed + '-2';
+  }
+
+  // Step-by-step run log — visible in the UI so the user sees exactly
+  // what happens when they click Run (helps a lot when things go wrong).
+  type LogEntry = { ts: string; level: 'info' | 'ok' | 'warn' | 'err'; msg: string };
+  const [runLog, setRunLog] = useState<LogEntry[]>([]);
+  const appendLog = (level: LogEntry['level'], msg: string) => {
+    const ts = new Date().toISOString().slice(11, 19);
+    setRunLog((prev) => [...prev.slice(-199), { ts, level, msg }]);
+  };
+  const clearLog = () => setRunLog([]);
+
+  const currentShortId = PROJECT_NAME_TO_SHORT[projectName] || '';
+
+  // Which experiment (if any) is promoted as "primary" for this project.
+  // When set, the Semantic Clusters tab loads this experiment instead of the
+  // static pipeline file.
+  const [activeExpId, setActiveExpId] = useState<string | null>(null);
+
+  const loadList = async () => {
+    setLoadingList(true);
+    try {
+      const idx = await fetchPlaygroundIndex();
+      if (showAllProjects || !currentShortId) {
+        setExperiments(idx);
+      } else {
+        setExperiments(idx.filter((e) => e.project === currentShortId));
+      }
+    } finally {
+      setLoadingList(false);
+    }
+  };
+
+  const loadActive = async () => {
+    if (!currentShortId) { setActiveExpId(null); return; }
+    try {
+      const info = await fetchActiveExperiment(currentShortId);
+      setActiveExpId(info.expId);
+    } catch {
+      setActiveExpId(null);
+    }
+  };
+
+  async function handleMakePrimary(expId: string) {
+    if (!currentShortId) return;
+    try {
+      await setActiveExperiment(currentShortId, expId);
+      setActiveExpId(expId);
+      onActiveChanged?.();
+      appendLog('ok', `✓ "${expId}" is now the primary semantic clustering for ${currentShortId}. Go to the Semantic Clusters tab to see it.`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      appendLog('err', `✗ Could not promote: ${msg}`);
+    }
+  }
+
+  async function handleClearPrimary() {
+    if (!currentShortId) return;
+    try {
+      await clearActiveExperiment(currentShortId);
+      setActiveExpId(null);
+      onActiveChanged?.();
+      appendLog('info', `Reverted ${currentShortId} to the pipeline's semantic clustering.`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      appendLog('err', `✗ Could not clear: ${msg}`);
+    }
+  }
+
+  // On mount + project change: refresh list, health, restore state.
+  // If the last-selected experiment belongs to a different project, clear it
+  // so the user doesn't see cross-project results by accident.
+  useEffect(() => {
+    loadList();
+    loadActive();
+    checkPlaygroundHealth().then((h) => {
+      setSidecarOk(h !== null);
+      setApiKeySet(h?.openai_key_set ?? null);
+    });
+    if (selectedExpId) {
+      fetchPlaygroundExperiment(selectedExpId).then((e) => {
+        if (!e) {
+          setSelectedExpId(null);
+          setSelectedExp(null);
+          return;
+        }
+        const expProject = (e.config as { project?: string })?.project;
+        if (currentShortId && expProject && expProject !== currentShortId && !showAllProjects) {
+          // Stale selection from a different project — clear
+          setSelectedExpId(null);
+          setSelectedExp(null);
+        } else {
+          setSelectedExp(e);
+        }
+      });
+    }
+    if (activeTaskId) {
+      fetchPlaygroundTask(activeTaskId).then((t) => {
+        if (t) setActiveTask(t);
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, showAllProjects, currentShortId]);
+
+  // Task polling — runs whenever activeTask exists and is still "running"
+  useEffect(() => {
+    if (!activeTask || activeTask.status !== 'running') {
+      if (pollRef.current) { window.clearInterval(pollRef.current); pollRef.current = null; }
+      return;
+    }
+    const tick = async () => {
+      const t = await fetchPlaygroundTask(activeTask.id);
+      if (!t) {
+        appendLog('warn', `poll: task not found (sidecar may have restarted)`);
+        return;
+      }
+      setActiveTask(t);
+      if (t.status === 'completed') {
+        appendLog('ok', `✓ Task completed in ${Math.floor((Date.now() - (runStartedAt || Date.now())) / 1000)}s`);
+        if (t.expId) appendLog('info', `  experiment id: ${t.expId}`);
+        setActiveTaskId(null);
+        setRunStartedAt(null);
+        if (t.expId) {
+          appendLog('info', `Loading result …`);
+          setSelectedExpId(t.expId);
+          const e = await fetchPlaygroundExperiment(t.expId);
+          if (e) {
+            setSelectedExp(e);
+            appendLog('ok', `✓ Result loaded: ${e.stats.multiClusters} multi-clusters, ${e.stats.singletons} singletons, ${e.stats.finalUnique} unique`);
+          } else {
+            appendLog('warn', `result file not found for ${t.expId}`);
+          }
+        }
+        // Advance the experiment name so the next run is a fresh experiment
+        // without the user having to retype. "Experiment GO - 01" → "- 02", etc.
+        const nextName = nextExperimentName(expName);
+        if (nextName !== expName) {
+          patchForm({ expName: nextName });
+          appendLog('info', `Next experiment name pre-filled: "${nextName}"`);
+        }
+        appendLog('info', `Refreshing experiment list …`);
+        await loadList();
+        appendLog('ok', `✓ Done.`);
+      } else if (t.status === 'failed' || t.status === 'interrupted') {
+        appendLog('err', `✗ Task ${t.status}: ${t.error || 'no detail'}`);
+        setActiveTaskId(null);
+        setRunStartedAt(null);
+        setRunError(t.error || 'Experiment failed');
+      } else {
+        appendLog('info', `poll: status=${t.status}`);
+      }
+    };
+    pollRef.current = window.setInterval(tick, 2000);
+    // Fire one immediately
+    tick();
+    return () => {
+      if (pollRef.current) { window.clearInterval(pollRef.current); pollRef.current = null; }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTask?.id, activeTask?.status]);
+
+  function toggleField(k: string) {
+    patchForm({ fields: { ...fields, [k]: !fields[k] } });
+  }
+
+  const slug = (expName || 'experiment').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'experiment';
+  const expId = `exp-${slug}-${scope}-${sourceFilter}-${model.includes('large') ? 'lg' : 'sm'}-d${dim}-thr${Math.round(threshold * 100)}`;
+
+  const config = {
+    id: expId, name: expName,
+    project: projectId, scope, sourceFilter,
+    model, dimensions: dim, threshold, minClusterSize: minSize,
+    fields, ...(limit ? { limit } : {}),
+  };
+
+  const running = activeTask?.status === 'running';
+
+  async function handleRun() {
+    setRunError(null);
+    setRunStartedAt(Date.now());
+    clearLog();
+    appendLog('info', `▶ Starting experiment "${expName}" on project ${projectId || '(none)'}`);
+    appendLog('info', `  config: scope=${scope}, source=${sourceFilter}, model=${model}, dim=${dim}, thr=${threshold.toFixed(2)}, minSize=${minSize}${limit ? `, limit=${limit}` : ''}`);
+    const enabledFields = Object.entries(fields).filter(([, v]) => v === true || (typeof v === 'number' && v > 0)).map(([k]) => k);
+    appendLog('info', `  fields: ${enabledFields.join(', ')}`);
+    appendLog('info', `POST /playground_api/run …`);
+    try {
+      const task = await runPlaygroundExperiment(config);
+      if (task.status === 'failed' || task.status === 'interrupted') {
+        appendLog('err', `✗ Task failed at creation: ${task.error || 'no detail'}`);
+        setRunError(task.error || `Task ${task.status}`);
+        setRunStartedAt(null);
+        return;
+      }
+      appendLog('ok', `✓ Task queued: ${task.id} (status: ${task.status})`);
+      appendLog('info', `Polling every 2s until done…`);
+      setActiveTask(task);
+      setActiveTaskId(task.id);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      appendLog('err', `✗ POST failed: ${msg}`);
+      setRunError(msg);
+      setRunStartedAt(null);
+    }
+  }
+
+  async function handleRunDomain() {
+    setRunError(null);
+    setRunStartedAt(Date.now());
+    clearLog();
+    const domainId = `exp-domains-${slug}-${scope}-${sourceFilter}`;
+    const domainName = `Domains: ${expName}`;
+    appendLog('info', `▶ Starting domain classification on project ${projectId || '(none)'}`);
+    appendLog('info', `  scope=${scope} source=${sourceFilter} — fixed taxonomy (15 domains)`);
+    appendLog('info', `POST /playground_api/domains/run …`);
+    try {
+      const task = await runDomainClassification({
+        id: domainId, name: domainName,
+        project: projectId, scope, sourceFilter,
+        model: 'gpt-5.4',
+        ...(limit ? { limit } : {}),
+      });
+      if (task.status === 'failed' || task.status === 'interrupted') {
+        appendLog('err', `✗ Task failed at creation: ${task.error || 'no detail'}`);
+        setRunError(task.error || `Task ${task.status}`);
+        setRunStartedAt(null);
+        return;
+      }
+      appendLog('ok', `✓ Task queued: ${task.id} (status: ${task.status})`);
+      appendLog('info', `Polling every 2s until done…`);
+      setActiveTask(task);
+      setActiveTaskId(task.id);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      appendLog('err', `✗ POST failed: ${msg}`);
+      setRunError(msg);
+      setRunStartedAt(null);
+    }
+  }
+
+  async function openExperiment(id: string) {
+    setSelectedExpId(id);
+    const e = await fetchPlaygroundExperiment(id);
+    if (e) setSelectedExp(e);
+  }
+
+  function closeExperiment() {
+    setSelectedExp(null);
+    setSelectedExpId(null);
+  }
+
+  async function handleDelete(id: string) {
+    if (!window.confirm(`Delete experiment "${id}"? This cannot be undone.`)) return;
+    await deletePlaygroundExperiment(id);
+    if (selectedExp?.id === id) closeExperiment();
+    await loadList();
+  }
+
+  const runElapsed = runStartedAt ? Math.floor((Date.now() - runStartedAt) / 1000) : 0;
+  // Force re-render of elapsed time every second while running
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!running) return;
+    const id = window.setInterval(() => setTick((x) => x + 1), 1000);
+    return () => window.clearInterval(id);
+  }, [running]);
+
+  return (
+    <div className="space-y-4">
+      {/* Intro */}
+      <div className="bg-gradient-to-r from-fuchsia-950/60 to-[#16213e] p-4 rounded-lg border border-fuchsia-800/40">
+        <div className="text-xs uppercase tracking-wider text-fuchsia-300 font-bold mb-2">
+          AI Playground — Iterate on Embedding Experiments
+        </div>
+        <p className="text-xs text-gray-400 leading-relaxed">
+          Try different combinations of <strong>scope</strong> (which reports go in),{' '}
+          <strong>fields</strong> (what text gets embedded), <strong>model</strong>,{' '}
+          <strong>dimensions</strong>, and <strong>cosine threshold</strong>. Each experiment
+          is independent from the production Semantic stage — nothing in the main pipeline
+          changes. Embeddings are cached by content hash, so re-running with small tweaks
+          reuses prior work for free.
+        </p>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* Config form */}
+        <div className="bg-[#16213e] p-5 rounded-lg border border-fuchsia-900/40">
+          <h3 className="text-white font-bold mb-3">Configure Experiment</h3>
+
+          <div className="space-y-3 text-sm">
+            <div>
+              <label className="block text-xs text-gray-400 uppercase mb-1">Name</label>
+              <input
+                value={expName}
+                onChange={(e) => patchForm({ expName: e.target.value })}
+                className="w-full bg-[#0f0f1a] border border-[#1e2d50] rounded px-3 py-2 text-white text-sm"
+                placeholder="my-experiment"
+              />
+              <div className="text-[10px] text-gray-500 mt-1">
+                Experiment id: <code className="text-fuchsia-300">{expId}</code>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs text-gray-400 uppercase mb-1">Scope</label>
+                <select value={scope} onChange={(e) => patchForm({ scope: e.target.value })}
+                  className="w-full bg-[#0f0f1a] border border-[#1e2d50] rounded px-2 py-1.5 text-white text-sm">
+                  <option value="post-family">post-family (production)</option>
+                  <option value="post-ast">post-AST</option>
+                  <option value="active">active</option>
+                  <option value="final-kept">final-kept</option>
+                  <option value="post-collision">post-collision</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs text-gray-400 uppercase mb-1">Source filter</label>
+                <select value={sourceFilter} onChange={(e) => patchForm({ sourceFilter: e.target.value })}
+                  className="w-full bg-[#0f0f1a] border border-[#1e2d50] rounded px-2 py-1.5 text-white text-sm">
+                  <option value="all">All sources</option>
+                  <option value="normal">SQL only</option>
+                  <option value="cube">Cube only</option>
+                  <option value="custom_sql_free_form">Free SQL only</option>
+                  <option value="exclude-cube">Exclude cubes</option>
+                </select>
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-xs text-gray-400 uppercase mb-1">Fields embedded</label>
+              <div className="grid grid-cols-2 gap-2 text-xs">
+                {['name','path','owner','attributes','metrics','tables','filters','sql','normalizeSql'].map((k) => (
+                  <label key={k} className="flex items-center gap-2 cursor-pointer text-gray-300">
+                    <input type="checkbox" checked={!!fields[k]} onChange={() => toggleField(k)} />
+                    <span>{k}</span>
+                  </label>
+                ))}
+              </div>
+              {fields.sql && (
+                <div className="mt-2 flex items-center gap-2 text-xs text-gray-400">
+                  <span>max SQL chars:</span>
+                  <input type="number" min={100} max={8000} step={100}
+                    value={Number(fields.maxSqlChars) || 2000}
+                    onChange={(e) => patchForm({ fields: { ...fields, maxSqlChars: parseInt(e.target.value) || 2000 } })}
+                    className="w-24 bg-[#0f0f1a] border border-[#1e2d50] rounded px-2 py-1 text-white" />
+                </div>
+              )}
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs text-gray-400 uppercase mb-1">Model</label>
+                <select value={model} onChange={(e) => {
+                  const m = e.target.value;
+                  patchForm({ model: m, ...(m.includes('small') ? { dim: 1536 } : {}) });
+                }}
+                  className="w-full bg-[#0f0f1a] border border-[#1e2d50] rounded px-2 py-1.5 text-white text-sm">
+                  <option value="text-embedding-3-large">3-large (3072d, higher quality)</option>
+                  <option value="text-embedding-3-small">3-small (1536d, cheaper)</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs text-gray-400 uppercase mb-1">Dimensions</label>
+                <select value={dim} onChange={(e) => patchForm({ dim: parseInt(e.target.value) })}
+                  disabled={model.includes('small')}
+                  className="w-full bg-[#0f0f1a] border border-[#1e2d50] rounded px-2 py-1.5 text-white text-sm disabled:opacity-50">
+                  {model.includes('small') ? (
+                    <option value={1536}>1536</option>
+                  ) : (
+                    <>
+                      <option value={3072}>3072</option>
+                      <option value={1536}>1536 (reduced)</option>
+                      <option value={768}>768 (reduced)</option>
+                    </>
+                  )}
+                </select>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs text-gray-400 uppercase mb-1">
+                  Cosine threshold: <span className="text-fuchsia-300 font-bold">{threshold.toFixed(2)}</span>
+                </label>
+                <input type="range" min={0.70} max={0.98} step={0.01}
+                  value={threshold}
+                  onChange={(e) => patchForm({ threshold: parseFloat(e.target.value) })}
+                  className="w-full accent-fuchsia-500" />
+              </div>
+              <div>
+                <label className="block text-xs text-gray-400 uppercase mb-1">Min cluster size</label>
+                <input type="number" min={2} value={minSize}
+                  onChange={(e) => patchForm({ minSize: parseInt(e.target.value) || 2 })}
+                  className="w-full bg-[#0f0f1a] border border-[#1e2d50] rounded px-2 py-1.5 text-white text-sm" />
+              </div>
+            </div>
+
+            <div>
+              <label className="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+                <input type="checkbox" checked={limit !== null}
+                  onChange={(e) => patchForm({ limit: e.target.checked ? 200 : null })} />
+                <span>Dry-run limit (cheap testing):</span>
+                {limit !== null && (
+                  <input type="number" min={10} value={limit}
+                    onChange={(e) => patchForm({ limit: parseInt(e.target.value) || 200 })}
+                    className="w-20 bg-[#0f0f1a] border border-[#1e2d50] rounded px-2 py-0.5 text-white" />
+                )}
+              </label>
+            </div>
+          </div>
+
+          <div className="mt-4 space-y-2">
+            {/* Sidecar status pill */}
+            <div className="flex items-center gap-2 text-xs">
+              <span className={`w-2 h-2 rounded-full ${
+                sidecarOk == null ? 'bg-gray-500' : sidecarOk ? 'bg-emerald-500' : 'bg-red-500'
+              }`}></span>
+              {sidecarOk == null ? (
+                <span className="text-gray-500">checking sidecar…</span>
+              ) : sidecarOk ? (
+                <span className="text-emerald-300">
+                  Sidecar connected · OpenAI key {apiKeySet ? 'set ✓' : 'MISSING ✗'}
+                </span>
+              ) : (
+                <span className="text-red-300">
+                  Sidecar not running. Start it: <code className="bg-[#0f0f1a] px-1 rounded text-emerald-300">python playground_server.py</code>
+                </span>
+              )}
+            </div>
+
+            <div className="flex gap-2">
+              <button
+                onClick={handleRun}
+                disabled={running || sidecarOk === false || apiKeySet === false}
+                className="bg-fuchsia-600 hover:bg-fuchsia-500 disabled:bg-fuchsia-900 disabled:text-gray-500 disabled:cursor-not-allowed text-white text-sm font-semibold px-5 py-2.5 rounded flex items-center gap-2"
+                title={
+                  sidecarOk === false ? 'Start the sidecar first'
+                  : apiKeySet === false ? 'OPENAI_API_KEY missing on server'
+                  : 'Run experiment now'
+                }
+              >
+                {running ? (
+                  <>
+                    <span className="animate-spin inline-block w-4 h-4 border-2 border-white border-t-transparent rounded-full"></span>
+                    Running… <span className="text-xs font-normal opacity-80">({runElapsed}s)</span>
+                  </>
+                ) : (
+                  <>▶ Run Experiment</>
+                )}
+              </button>
+              <button
+                onClick={handleRunDomain}
+                disabled={running || sidecarOk === false || apiKeySet === false}
+                className="bg-amber-600 hover:bg-amber-500 disabled:bg-amber-900 disabled:text-gray-500 disabled:cursor-not-allowed text-white text-sm font-semibold px-4 py-2.5 rounded flex items-center gap-2"
+                title="Classify reports into a fixed list of business domains (Inventory, Purchase Orders, Sales, …) using GPT. Produces a domain-per-cluster experiment that can be Made Primary just like a cosine experiment."
+              >
+                🏷 Classify by Domain
+              </button>
+              <button onClick={loadList}
+                className="bg-[#0f0f1a] hover:bg-[#1a2a4a] text-gray-300 text-sm font-semibold px-4 py-2 rounded border border-[#1e2d50]">
+                ↻ Refresh list
+              </button>
+              <details className="ml-auto">
+                <summary className="cursor-pointer text-xs text-gray-500 hover:text-gray-300 py-2">
+                  View CLI equivalent
+                </summary>
+                <pre className="bg-[#0f0f1a] border border-[#1e2d50] text-emerald-300 text-[10px] font-mono p-2 rounded mt-1 max-h-40 overflow-auto">{`echo '${JSON.stringify(config)}' | python -m db.compute.playground -`}</pre>
+              </details>
+            </div>
+
+            {runError && (
+              <div className="bg-red-950/40 border border-red-700/50 text-red-200 text-xs p-3 rounded">
+                <strong>Run failed:</strong> {runError}
+              </div>
+            )}
+
+            {/* Step-by-step run log */}
+            {runLog.length > 0 && (
+              <div className="bg-[#0f0f1a] border border-fuchsia-700/40 rounded overflow-hidden">
+                <div className="flex items-center justify-between px-3 py-2 bg-fuchsia-950/30 border-b border-fuchsia-700/40">
+                  <span className="text-[10px] uppercase tracking-wider text-fuchsia-300 font-bold">
+                    Run log
+                  </span>
+                  <button onClick={clearLog} className="text-[10px] text-gray-500 hover:text-gray-300">
+                    clear
+                  </button>
+                </div>
+                <div className="max-h-48 overflow-y-auto font-mono text-[11px] p-2 space-y-0.5">
+                  {runLog.map((e, i) => {
+                    const cls = e.level === 'err' ? 'text-red-300'
+                      : e.level === 'warn' ? 'text-amber-300'
+                      : e.level === 'ok' ? 'text-emerald-300'
+                      : 'text-gray-400';
+                    return (
+                      <div key={i} className="flex gap-2">
+                        <span className="text-gray-600">{e.ts}</span>
+                        <span className={cls}>{e.msg}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            <div className="text-[11px] text-gray-500 leading-relaxed">
+              Clicking Run POSTs the config to the Python sidecar. It embeds (cached by content hash),
+              clusters, and writes <code className="text-gray-400">public/data/_playground/{expId}.json</code>.
+              Duration: ~5s if all embeddings cached, up to a few minutes for fresh embedding passes.
+            </div>
+          </div>
+        </div>
+
+        {/* Experiments list */}
+        <div className="bg-[#16213e] p-5 rounded-lg border border-fuchsia-900/40">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-white font-bold">Saved Experiments</h3>
+            <span className="text-xs text-gray-500">{experiments.length} total</span>
+          </div>
+          {/* Project-scope toggle */}
+          <div className="flex items-center gap-2 mb-3 text-xs">
+            <button
+              onClick={() => setShowAllProjects(false)}
+              className={`px-2.5 py-1 rounded border ${
+                !showAllProjects
+                  ? 'bg-fuchsia-900/50 text-fuchsia-200 border-fuchsia-700'
+                  : 'bg-[#0f0f1a] text-gray-400 border-[#1e2d50] hover:bg-[#1a2a4a]'
+              }`}
+              title={`Only experiments run against ${projectName || '(no project)'}`}
+            >
+              This project only
+            </button>
+            <button
+              onClick={() => setShowAllProjects(true)}
+              className={`px-2.5 py-1 rounded border ${
+                showAllProjects
+                  ? 'bg-blue-900/50 text-blue-200 border-blue-700'
+                  : 'bg-[#0f0f1a] text-gray-400 border-[#1e2d50] hover:bg-[#1a2a4a]'
+              }`}
+            >
+              All projects
+            </button>
+            {currentShortId && !showAllProjects && (
+              <span className="text-[10px] text-gray-500 ml-auto">
+                filtering by <code className="text-gray-400">{currentShortId}</code>
+              </span>
+            )}
+          </div>
+          {loadingList ? (
+            <div className="text-xs text-gray-500 py-4">Loading…</div>
+          ) : experiments.length === 0 ? (
+            <div className="text-xs text-gray-500 py-4">
+              None yet for this project. Configure + run via the command on the left.
+            </div>
+          ) : (
+            <div className="space-y-2 max-h-[60vh] overflow-y-auto">
+              {activeExpId && (
+                <div className="text-[11px] text-amber-300 bg-amber-950/30 border border-amber-700/40 rounded px-2 py-1.5 flex items-center gap-2">
+                  <span>⭐</span>
+                  <span className="flex-1 min-w-0 truncate">
+                    Primary semantic clustering for <code className="text-amber-200">{currentShortId}</code> is
+                    {' '}<strong className="text-amber-200">{activeExpId}</strong>. The Semantic Clusters tab now loads from this experiment.
+                  </span>
+                  <button onClick={handleClearPrimary}
+                    className="text-[10px] text-amber-200 hover:text-white underline flex-shrink-0">
+                    Revert to pipeline
+                  </button>
+                </div>
+              )}
+              {experiments.map((e) => {
+                const isSelected = selectedExp?.id === e.id;
+                const isActive = activeExpId === e.id;
+                const canPromote = e.project === currentShortId; // same-project only
+                const isDomain = (e.config as { mode?: string })?.mode === 'domain';
+                return (
+                  <div key={e.id}
+                    className={`p-3 rounded border-l-4 ${
+                      isActive ? 'border-amber-400' : (isDomain ? 'border-sky-500' : 'border-fuchsia-500')
+                    } ${
+                      isSelected ? 'bg-fuchsia-900/30 ring-1 ring-fuchsia-500' : 'bg-[#0f0f1a] hover:bg-[#1a2a4a]'
+                    }`}>
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex-1 min-w-0 cursor-pointer" onClick={() => openExperiment(e.id)}>
+                        <div className="text-sm text-white font-semibold truncate flex items-center gap-1.5">
+                          {isActive && <span className="text-amber-300" title="Primary semantic clustering">⭐</span>}
+                          {isDomain && <span className="text-sky-300 text-[9px] font-bold bg-sky-950/60 border border-sky-700/60 rounded px-1 py-0.5" title="Business-domain classification experiment">DOMAIN</span>}
+                          <span className="truncate">{e.name}</span>
+                        </div>
+                        <div className="text-[11px] text-gray-500 font-mono truncate">{e.id}</div>
+                      </div>
+                      <button
+                        onClick={(ev) => { ev.stopPropagation(); handleDelete(e.id); }}
+                        className="text-xs text-red-400 hover:text-red-300 flex-shrink-0"
+                        title="Delete experiment"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                    <div className="text-xs text-gray-400 mt-1 flex flex-wrap gap-2 cursor-pointer" onClick={() => openExperiment(e.id)}>
+                      <span>{e.config.scope}</span>
+                      <span>· src:{e.config.sourceFilter}</span>
+                      <span>· {e.config.model.replace('text-embedding-3-','3-')}/{e.config.dim}d</span>
+                      <span>· thr {e.config.threshold.toFixed(2)}</span>
+                    </div>
+                    <div className="text-xs mt-1 flex items-center justify-between gap-2">
+                      <div className="cursor-pointer flex-1 min-w-0" onClick={() => openExperiment(e.id)}>
+                        <span className="text-emerald-300">{e.stats.multiClusters}</span>{' '}
+                        <span className="text-gray-500">multi ·</span>{' '}
+                        <span className="text-slate-300">{e.stats.singletons}</span>{' '}
+                        <span className="text-gray-500">singletons ·</span>{' '}
+                        <span className="text-amber-300">{e.stats.finalUnique}</span>{' '}
+                        <span className="text-gray-500">unique</span>
+                      </div>
+                      {canPromote && (
+                        isActive ? (
+                          <span
+                            className="text-[10px] font-bold text-amber-300 bg-amber-950/40 border border-amber-700/60 rounded px-2 py-0.5 flex-shrink-0"
+                            title="This experiment is the primary semantic clustering for this project"
+                          >
+                            PRIMARY
+                          </span>
+                        ) : (
+                          <button
+                            onClick={(ev) => { ev.stopPropagation(); handleMakePrimary(e.id); }}
+                            className="text-[10px] text-amber-300 hover:text-amber-100 border border-amber-700/50 hover:border-amber-500 rounded px-2 py-0.5 flex-shrink-0"
+                            title="Use this experiment as the primary Semantic Clusters view for this project"
+                          >
+                            Make Primary
+                          </button>
+                        )
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Results pane */}
+      {selectedExp && (
+        <div className="bg-[#16213e] p-5 rounded-lg border border-fuchsia-700/50">
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <h3 className="text-lg text-white font-bold">{selectedExp.name}</h3>
+              <div className="text-xs text-gray-500 font-mono">{selectedExp.id}</div>
+            </div>
+            <button onClick={closeExperiment}
+              className="text-gray-400 hover:text-white text-xl leading-none">×</button>
+          </div>
+
+          <div className="grid grid-cols-5 gap-3 mb-4">
+            {[
+              ['Input reports', selectedExp.stats.inputReports, 'border-blue-500'],
+              ['Embedded', selectedExp.stats.reportsEmbedded, 'border-blue-500'],
+              ['Cosine edges', selectedExp.stats.edges, 'border-fuchsia-500'],
+              ['Multi-clusters', selectedExp.stats.multiClusters, 'border-emerald-500'],
+              ['Final unique', selectedExp.stats.finalUnique, 'border-amber-500'],
+            ].map(([label, val, cls]) => (
+              <div key={label as string} className={`bg-[#0f0f1a] p-3 rounded border-l-4 ${cls}`}>
+                <div className="text-[10px] text-gray-400 uppercase">{label as string}</div>
+                <div className="text-lg font-bold text-white">{(val as number).toLocaleString()}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* Interactive 2D Graph View */}
+          {selectedExp.viz && selectedExp.viz.scatter.length > 0 ? (
+            <ExperimentGraphView exp={selectedExp} onClusterClick={setSelectedClusterId} />
+          ) : (
+            <div className="bg-[#0f0f1a] border border-amber-700/40 rounded-lg p-4 mb-4">
+              <div className="text-sm font-bold text-amber-300 mb-1">📊 Graph View unavailable for this experiment</div>
+              <div className="text-xs text-gray-400 leading-relaxed">
+                This experiment was run before the Graph View feature was added, so it has no 2D projection or
+                pairwise cosine data stored. Re-run it (same config) from the panel above and the new result will
+                include the interactive graph. Embeddings are cached — it'll be fast.
+              </div>
+            </div>
+          )}
+
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-xs text-gray-400 uppercase">
+              Clusters <span className="text-gray-600">({selectedExp.clusters.length} total · click any to expand)</span>
+            </div>
+            {selectedClusterId && (
+              <button onClick={() => setSelectedClusterId(null)}
+                className="text-xs text-gray-400 hover:text-white">
+                Collapse all
+              </button>
+            )}
+          </div>
+          <div className="space-y-1 max-h-[60vh] overflow-y-auto pr-1">
+            {selectedExp.clusters.slice(0, 200).map((c) => {
+              const isOpen = selectedClusterId === c.id;
+              return (
+                <div key={c.id} className="bg-[#0f0f1a] rounded border-l-2 border-fuchsia-700/50 text-sm">
+                  {/* Header row — clickable */}
+                  <div
+                    className="p-2 cursor-pointer hover:bg-[#1a2a4a]"
+                    onClick={() => setSelectedClusterId(isOpen ? null : c.id)}
+                  >
+                    <div className="flex items-center gap-3">
+                      <span className="text-gray-500 text-xs w-3">{isOpen ? '▾' : '▸'}</span>
+                      <span className="text-[10px] font-mono text-fuchsia-300">{c.id}</span>
+                      <span className="text-xs font-semibold text-white">{c.size} reports</span>
+                      {c.avgCosine != null && (
+                        <span className="text-[11px] text-gray-500">
+                          avg cos {c.avgCosine.toFixed(3)}
+                          {c.minCosine != null && ` · min ${c.minCosine.toFixed(3)}`}
+                        </span>
+                      )}
+                      <span className="text-[11px] text-gray-500">
+                        {c.totalExecutions.toLocaleString()} execs
+                      </span>
+                    </div>
+                    <div className="text-xs text-gray-300 truncate ml-6">{c.primaryName}</div>
+                  </div>
+
+                  {/* Expanded member list */}
+                  {isOpen && (
+                    <div className="border-t border-[#1e2d50] px-2 py-2 space-y-1">
+                      <div className="text-[10px] text-gray-500 uppercase tracking-wider mb-1">
+                        All {c.memberIds.length} members (primary marked ✓)
+                      </div>
+                      <table className="w-full text-xs">
+                        <thead>
+                          <tr className="text-[10px] text-gray-500 uppercase">
+                            <th className="text-left py-1 px-1 w-20">Role</th>
+                            <th className="text-left py-1 px-1">Name</th>
+                            <th className="text-left py-1 px-1 w-14">Source</th>
+                            <th className="text-right py-1 px-1">Execs</th>
+                            <th className="text-right py-1 px-1">Users</th>
+                            <th className="text-right py-1 px-1">A/M/T/F</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {[
+                            c.primaryReportId,
+                            ...c.memberIds
+                              .filter((mid) => mid !== c.primaryReportId)
+                              .sort((a, b) => (reportById.get(b)?.executions ?? 0) - (reportById.get(a)?.executions ?? 0)),
+                          ].map((mid) => {
+                            const r = reportById.get(mid);
+                            const isPrimary = mid === c.primaryReportId;
+                            return (
+                              <tr key={mid} className={`border-t border-[#1e2d50] ${isPrimary ? 'bg-amber-950/30' : ''}`}>
+                                <td className="py-1 px-1 whitespace-nowrap">
+                                  <div className="flex items-center gap-1 flex-wrap">
+                                    {isPrimary ? (
+                                      <span className="text-[9px] font-bold text-amber-300 bg-amber-950/50 border border-amber-700/60 rounded px-1 py-0.5">⭐ PRIMARY</span>
+                                    ) : (
+                                      <span className="text-[9px] text-gray-500">member</span>
+                                    )}
+                                    <FamilySiblingsIndicator siblings={r?.familySiblings} />
+                                  </div>
+                                </td>
+                                <td className={`py-1 px-1 ${isPrimary ? 'text-amber-100 font-semibold' : 'text-gray-200'}`}>
+                                  {r?.name || <span className="text-gray-600 font-mono">{mid.slice(0, 8)}…</span>}
+                                  {r?.path && (
+                                    <div className="text-[10px] text-gray-500 truncate max-w-[40vw]" title={r.path}>
+                                      {r.path}
+                                    </div>
+                                  )}
+                                </td>
+                                <td className="py-1 px-1"><SourceTypePill sourceType={r?.sourceType} /></td>
+                                <td className="py-1 px-1 text-right font-mono text-gray-400">
+                                  {r?.executions?.toLocaleString() ?? '—'}
+                                </td>
+                                <td className="py-1 px-1 text-right font-mono text-gray-500">
+                                  {r?.users ?? '—'}
+                                </td>
+                                <td className="py-1 px-1 text-right font-mono text-[10px] text-gray-500">
+                                  {r ? `${r.attributeCount ?? 0}/${r.metricCount}/${r.tableCount}/${r.filterCount}` : '—'}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                      {c.memberIds.some((mid) => !reportById.get(mid)) && (
+                        <div className="text-[10px] text-amber-400 mt-1">
+                          Some members aren't in the current reports.json view (e.g., retired or different project).
+                          Switch to the relevant project to see their full detail.
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+            {selectedExp.clusters.length > 200 && (
+              <div className="text-[11px] text-gray-500 text-center py-2">
+                Showing first 200 of {selectedExp.clusters.length} clusters. Use search/filter to narrow down.
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// DENSITY CLUSTERING TAB — UMAP + HDBSCAN, separate from AI Playground
+// ─────────────────────────────────────────────────────────────────────
+
+function DensityClusteringTab({
+  projectId, projectName, reportById, onActiveChanged,
+}: {
+  projectId: string;
+  projectName: string;
+  reportById: Map<string, ReportDetail>;
+  onActiveChanged?: () => void;
+}) {
+  const currentShortId = PROJECT_NAME_TO_SHORT[projectName] || '';
+
+  const [form, setForm] = usePersistentState('density.form.v2', {
+    name: 'density-v1',
+    scope: 'post-family',
+    sourceFilter: 'all',
+    umapNeighbors: 30,
+    umapMinDist: 0.0,
+    umapComponents: 10,
+    minClusterSize: 15,
+    minSamples: 5,
+    clusterSelection: 'eom' as 'eom' | 'leaf',
+    limit: null as number | null,
+    // What goes into the embedding text. Flipping these changes what
+    // "similar" means — e.g., turn off SQL to cluster on business metadata
+    // only, turn off name/path to cluster by SQL shape only.
+    fields: {
+      name: true,
+      path: true,
+      owner: false,
+      attributes: true,
+      metrics: true,
+      tables: true,
+      filters: true,
+      sql: true,
+      normalizeSql: true,
+      maxSqlChars: 1500 as number,
+    } as Record<string, boolean | number>,
+  });
+  const patch = (p: Partial<typeof form>) => setForm((f) => ({ ...f, ...p }));
+
+  // Defensive defaults — if a previous version of this tab was persisted
+  // without `fields` (or any other new field), fall back to sensible values
+  // rather than crashing the render with form.fields[k] on undefined.
+  const DEFAULT_FIELDS: Record<string, boolean | number> = {
+    name: true, path: true, owner: false,
+    attributes: true, metrics: true, tables: true, filters: true,
+    sql: true, normalizeSql: true, maxSqlChars: 1500,
+  };
+  const fields = form.fields ?? DEFAULT_FIELDS;
+  // One-time self-heal: if state is missing fields, patch it in now.
+  useEffect(() => {
+    if (!form.fields) patch({ fields: DEFAULT_FIELDS });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const toggleField = (k: string) => patch({ fields: { ...fields, [k]: !fields[k] } });
+
+  const [experiments, setExperiments] = useState<PlaygroundExperimentIndexEntry[]>([]);
+  const [selectedExpId, setSelectedExpId] = usePersistentState<string | null>('density.selectedExpId', null);
+  const [selectedExp, setSelectedExp] = useState<PlaygroundExperiment | null>(null);
+  const [selectedClusterId, setSelectedClusterId] = useState<string | null>(null);
+  const [activeTaskId, setActiveTaskId] = usePersistentState<string | null>('density.activeTaskId', null);
+  const [activeTask, setActiveTask] = useState<PlaygroundTask | null>(null);
+  const [runError, setRunError] = useState<string | null>(null);
+  const [runStartedAt, setRunStartedAt] = useState<number | null>(null);
+  const [activeExpId, setActiveExpId] = useState<string | null>(null);
+  const [sidecarOk, setSidecarOk] = useState<boolean | null>(null);
+  const [apiKeySet, setApiKeySet] = useState<boolean | null>(null);
+  const pollRef = useRef<number | null>(null);
+
+  type LogEntry = { ts: string; level: 'info' | 'ok' | 'warn' | 'err'; msg: string };
+  const [runLog, setRunLog] = useState<LogEntry[]>([]);
+  const appendLog = (level: LogEntry['level'], msg: string) => {
+    const ts = new Date().toISOString().slice(11, 19);
+    setRunLog((prev) => [...prev.slice(-199), { ts, level, msg }]);
+  };
+  const clearLog = () => setRunLog([]);
+
+  const loadList = async () => {
+    const idx = await fetchPlaygroundIndex();
+    const forProject = currentShortId ? idx.filter((e) => e.project === currentShortId) : idx;
+    // Only density experiments
+    setExperiments(forProject.filter((e) => (e.config as { mode?: string })?.mode === 'density'));
+  };
+  const loadActive = async () => {
+    if (!currentShortId) { setActiveExpId(null); return; }
+    try {
+      const info = await fetchActiveExperiment(currentShortId);
+      setActiveExpId(info.expId);
+    } catch {
+      setActiveExpId(null);
+    }
+  };
+
+  useEffect(() => {
+    loadList();
+    loadActive();
+    fetchDensityDefaults().then((d) => {
+      if (d) patch({
+        umapNeighbors: d.umap_n_neighbors,
+        umapMinDist: d.umap_min_dist,
+        umapComponents: d.umap_n_components,
+        minClusterSize: d.hdbscan_min_cluster_size,
+        minSamples: d.hdbscan_min_samples,
+        clusterSelection: d.hdbscan_cluster_selection_method as 'eom' | 'leaf',
+      });
+    });
+    checkPlaygroundHealth().then((h) => {
+      setSidecarOk(h !== null);
+      setApiKeySet(h?.openai_key_set ?? null);
+    });
+    if (selectedExpId) {
+      fetchPlaygroundExperiment(selectedExpId).then((e) => {
+        if (e) setSelectedExp(e); else { setSelectedExpId(null); setSelectedExp(null); }
+      });
+    }
+    if (activeTaskId) {
+      fetchPlaygroundTask(activeTaskId).then((t) => { if (t) setActiveTask(t); });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, currentShortId]);
+
+  useEffect(() => {
+    if (!activeTask || activeTask.status !== 'running') {
+      if (pollRef.current) { window.clearInterval(pollRef.current); pollRef.current = null; }
+      return;
+    }
+    const tick = async () => {
+      const t = await fetchPlaygroundTask(activeTask.id);
+      if (!t) return;
+      setActiveTask(t);
+      if (t.status === 'completed') {
+        appendLog('ok', `✓ Task completed. Loading result…`);
+        if (t.expId) {
+          const e = await fetchPlaygroundExperiment(t.expId);
+          if (e) { setSelectedExp(e); setSelectedExpId(e.id); }
+          await loadList();
+        }
+        setActiveTask(null); setActiveTaskId(null); setRunStartedAt(null);
+      } else if (t.status === 'failed' || t.status === 'interrupted') {
+        appendLog('err', `✗ Task ${t.status}: ${t.error || 'no detail'}`);
+        setActiveTask(null); setActiveTaskId(null); setRunStartedAt(null);
+        setRunError(t.error || `Task ${t.status}`);
+      } else {
+        appendLog('info', `poll: status=${t.status}`);
+      }
+    };
+    pollRef.current = window.setInterval(tick, 2000);
+    tick();
+    return () => {
+      if (pollRef.current) { window.clearInterval(pollRef.current); pollRef.current = null; }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTask?.id, activeTask?.status]);
+
+  const running = activeTask?.status === 'running';
+  const runElapsed = runStartedAt ? Math.floor((Date.now() - runStartedAt) / 1000) : 0;
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!running) return;
+    const id = window.setInterval(() => setTick((x) => x + 1), 1000);
+    return () => window.clearInterval(id);
+  }, [running]);
+
+  const slug = (form.name || 'density').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'density';
+  const expId = `exp-density-${slug}-${form.scope}-${form.sourceFilter}-n${form.umapNeighbors}-m${form.minClusterSize}`;
+
+  async function handleRun() {
+    setRunError(null);
+    setRunStartedAt(Date.now());
+    clearLog();
+    appendLog('info', `▶ Starting density clustering on project ${projectId || '(none)'}`);
+    appendLog('info', `  UMAP: n_neighbors=${form.umapNeighbors}, min_dist=${form.umapMinDist}, n_components=${form.umapComponents}`);
+    appendLog('info', `  HDBSCAN: min_cluster_size=${form.minClusterSize}, min_samples=${form.minSamples}, selection=${form.clusterSelection}`);
+    appendLog('info', `POST /playground_api/density/run …`);
+    try {
+      const task = await runDensityClustering({
+        id: expId,
+        name: form.name,
+        project: projectId,
+        scope: form.scope,
+        sourceFilter: form.sourceFilter,
+        umapNeighbors: form.umapNeighbors,
+        umapMinDist: form.umapMinDist,
+        umapComponents: form.umapComponents,
+        minClusterSize: form.minClusterSize,
+        minSamples: form.minSamples,
+        clusterSelection: form.clusterSelection,
+        fields,
+        ...(form.limit ? { limit: form.limit } : {}),
+      });
+      if (task.status === 'failed' || task.status === 'interrupted') {
+        appendLog('err', `✗ Task failed at creation: ${task.error || 'no detail'}`);
+        setRunError(task.error || `Task ${task.status}`);
+        setRunStartedAt(null);
+        return;
+      }
+      appendLog('ok', `✓ Task queued: ${task.id}`);
+      appendLog('info', `Polling every 2s… (UMAP + HDBSCAN take ~30-90s on ~4k reports)`);
+      setActiveTask(task);
+      setActiveTaskId(task.id);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      appendLog('err', `✗ POST failed: ${msg}`);
+      setRunError(msg);
+      setRunStartedAt(null);
+    }
+  }
+
+  async function openExperiment(id: string) {
+    setSelectedExpId(id);
+    const e = await fetchPlaygroundExperiment(id);
+    if (e) setSelectedExp(e);
+  }
+  function closeExperiment() { setSelectedExp(null); setSelectedExpId(null); }
+  async function handleDelete(id: string) {
+    if (!window.confirm(`Delete "${id}"? This cannot be undone.`)) return;
+    await deletePlaygroundExperiment(id);
+    if (selectedExp?.id === id) closeExperiment();
+    await loadList();
+  }
+  async function handleMakePrimary(id: string) {
+    if (!currentShortId) return;
+    try {
+      await setActiveExperiment(currentShortId, id);
+      setActiveExpId(id);
+      onActiveChanged?.();
+      appendLog('ok', `✓ "${id}" is now the primary clustering for ${currentShortId}.`);
+    } catch (e) {
+      appendLog('err', `✗ Could not promote: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  async function handleClearPrimary() {
+    if (!currentShortId) return;
+    await clearActiveExperiment(currentShortId);
+    setActiveExpId(null);
+    onActiveChanged?.();
+    appendLog('info', `Reverted ${currentShortId} to the pipeline's clustering.`);
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="bg-gradient-to-r from-cyan-950/60 to-[#16213e] p-4 rounded-lg border border-cyan-800/40">
+        <div className="text-xs uppercase tracking-wider text-cyan-300 font-bold mb-2">
+          Density Clustering — UMAP + HDBSCAN
+        </div>
+        <p className="text-xs text-gray-400 leading-relaxed">
+          An alternative to the cosine-threshold Playground, tuned for ~1k–10k reports. <strong className="text-cyan-200">UMAP</strong> projects
+          OpenAI embeddings to ~10 dims (nonlinear, preserves local structure), then <strong className="text-cyan-200">HDBSCAN</strong> finds
+          dense regions. It auto-picks the number of clusters and explicitly labels reports that don't belong anywhere as <em>noise</em>
+          (instead of forcing them into a weak cluster). Expected on ~4k reports: ~60–120 clusters, ~5–10% noise, silhouette &gt; 0.35.
+          Embeddings are cached with the AI Playground, so re-runs that only change UMAP/HDBSCAN params are fast.
+        </p>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div className="bg-[#16213e] p-5 rounded-lg border border-cyan-900/40">
+          <h3 className="text-white font-bold mb-3">Configure Density Run</h3>
+          <div className="space-y-3 text-sm">
+            <div>
+              <label className="block text-xs text-gray-400 uppercase mb-1">Name</label>
+              <input value={form.name} onChange={(e) => patch({ name: e.target.value })}
+                className="w-full bg-[#0f0f1a] border border-[#1e2d50] rounded px-3 py-2 text-white text-sm" />
+              <div className="text-[10px] text-gray-500 mt-1">ID: <code className="text-cyan-300">{expId}</code></div>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs text-gray-400 uppercase mb-1">Scope</label>
+                <select value={form.scope} onChange={(e) => patch({ scope: e.target.value })}
+                  className="w-full bg-[#0f0f1a] border border-[#1e2d50] rounded px-2 py-1.5 text-white text-sm">
+                  <option value="post-family">post-family</option>
+                  <option value="post-ast">post-AST</option>
+                  <option value="active">active</option>
+                  <option value="final-kept">final-kept</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs text-gray-400 uppercase mb-1">Source Filter</label>
+                <select value={form.sourceFilter} onChange={(e) => patch({ sourceFilter: e.target.value })}
+                  className="w-full bg-[#0f0f1a] border border-[#1e2d50] rounded px-2 py-1.5 text-white text-sm">
+                  <option value="all">all</option>
+                  <option value="normal">SQL only</option>
+                  <option value="exclude-cube">exclude cubes</option>
+                  <option value="cube">cubes only</option>
+                </select>
+              </div>
+            </div>
+
+            <div className="pt-2 border-t border-[#1e2d50]">
+              <div className="flex items-center justify-between mb-2">
+                <div className="text-[10px] uppercase tracking-wider text-cyan-400 font-bold">
+                  Fields embedded <span className="text-gray-500 font-normal normal-case">(signals the LLM uses to decide "similar")</span>
+                </div>
+                <div className="flex gap-1">
+                  <button type="button"
+                    onClick={() => patch({ fields: { ...fields, name: true, path: true, owner: false, attributes: true, metrics: true, tables: true, filters: true, sql: true, normalizeSql: true } })}
+                    className="text-[9px] text-gray-400 hover:text-white border border-[#1e2d50] rounded px-1.5 py-0.5">
+                    all
+                  </button>
+                  <button type="button"
+                    onClick={() => patch({ fields: { ...fields, name: true, path: true, attributes: true, metrics: true, tables: true, filters: true, sql: false } })}
+                    className="text-[9px] text-gray-400 hover:text-white border border-[#1e2d50] rounded px-1.5 py-0.5"
+                    title="Business metadata only — cluster by what the report is, not how it fetches data">
+                    metadata only
+                  </button>
+                  <button type="button"
+                    onClick={() => patch({ fields: { ...fields, name: false, path: false, owner: false, attributes: false, metrics: false, tables: true, filters: false, sql: true, normalizeSql: true } })}
+                    className="text-[9px] text-gray-400 hover:text-white border border-[#1e2d50] rounded px-1.5 py-0.5"
+                    title="SQL shape only — cluster by query structure regardless of naming">
+                    SQL only
+                  </button>
+                </div>
+              </div>
+              <div className="grid grid-cols-3 gap-1.5 text-xs">
+                {[
+                  ['name', 'Report name'],
+                  ['path', 'Folder path'],
+                  ['owner', 'Owner'],
+                  ['attributes', 'Attributes'],
+                  ['metrics', 'Metrics'],
+                  ['tables', 'Tables'],
+                  ['filters', 'Filters'],
+                  ['sql', 'SQL text'],
+                  ['normalizeSql', 'Normalize SQL'],
+                ].map(([k, label]) => (
+                  <label key={k} className="flex items-center gap-1.5 cursor-pointer text-gray-300 hover:text-white">
+                    <input type="checkbox" checked={!!fields[k]} onChange={() => toggleField(k)} />
+                    <span>{label}</span>
+                  </label>
+                ))}
+              </div>
+              {fields.sql && (
+                <div className="mt-2 flex items-center gap-2 text-xs text-gray-400">
+                  <span>max SQL chars:</span>
+                  <input type="number" min={100} max={8000} step={100}
+                    value={Number(fields.maxSqlChars) || 1500}
+                    onChange={(e) => patch({ fields: { ...fields, maxSqlChars: parseInt(e.target.value) || 1500 } })}
+                    className="w-24 bg-[#0f0f1a] border border-[#1e2d50] rounded px-2 py-1 text-white" />
+                </div>
+              )}
+              <div className="mt-2 text-[10px] text-gray-500 leading-snug">
+                {(() => {
+                  const on = Object.entries(fields).filter(([k, v]) => typeof v === 'boolean' && v && k !== 'normalizeSql').map(([k]) => k);
+                  if (on.length === 0) return 'No fields selected — classifier will see only report IDs (useless). Turn on at least one.';
+                  return `Embedding will see: ${on.join(', ')}.`;
+                })()}
+              </div>
+            </div>
+
+            <div className="pt-2 border-t border-[#1e2d50]">
+              <div className="text-[10px] uppercase tracking-wider text-cyan-400 font-bold mb-2">UMAP (dimensionality reduction)</div>
+              <div className="grid grid-cols-3 gap-2">
+                <div>
+                  <label className="block text-[10px] text-gray-400 mb-1" title="How many neighbors define the local neighborhood. Higher = more global structure.">n_neighbors</label>
+                  <input type="number" min={5} max={200} value={form.umapNeighbors}
+                    onChange={(e) => patch({ umapNeighbors: parseInt(e.target.value) || 30 })}
+                    className="w-full bg-[#0f0f1a] border border-[#1e2d50] rounded px-2 py-1.5 text-white text-sm" />
+                </div>
+                <div>
+                  <label className="block text-[10px] text-gray-400 mb-1" title="Minimum distance between points in reduced space. 0.0 = tight clusters.">min_dist</label>
+                  <input type="number" min={0} max={1} step={0.05} value={form.umapMinDist}
+                    onChange={(e) => patch({ umapMinDist: parseFloat(e.target.value) || 0 })}
+                    className="w-full bg-[#0f0f1a] border border-[#1e2d50] rounded px-2 py-1.5 text-white text-sm" />
+                </div>
+                <div>
+                  <label className="block text-[10px] text-gray-400 mb-1" title="Dimensionality for HDBSCAN input (not the 2D viz).">n_components</label>
+                  <input type="number" min={2} max={50} value={form.umapComponents}
+                    onChange={(e) => patch({ umapComponents: parseInt(e.target.value) || 10 })}
+                    className="w-full bg-[#0f0f1a] border border-[#1e2d50] rounded px-2 py-1.5 text-white text-sm" />
+                </div>
+              </div>
+            </div>
+
+            <div className="pt-2 border-t border-[#1e2d50]">
+              <div className="text-[10px] uppercase tracking-wider text-cyan-400 font-bold mb-2">HDBSCAN (density clustering)</div>
+              <div className="grid grid-cols-3 gap-2">
+                <div>
+                  <label className="block text-[10px] text-gray-400 mb-1" title="Smallest group to call a cluster. Lower = more, smaller clusters + fewer noise points.">min_cluster_size</label>
+                  <input type="number" min={2} max={200} value={form.minClusterSize}
+                    onChange={(e) => patch({ minClusterSize: parseInt(e.target.value) || 15 })}
+                    className="w-full bg-[#0f0f1a] border border-[#1e2d50] rounded px-2 py-1.5 text-white text-sm" />
+                </div>
+                <div>
+                  <label className="block text-[10px] text-gray-400 mb-1" title="Required neighbors for a point to be 'core'. Higher = more conservative, more noise.">min_samples</label>
+                  <input type="number" min={1} max={50} value={form.minSamples}
+                    onChange={(e) => patch({ minSamples: parseInt(e.target.value) || 5 })}
+                    className="w-full bg-[#0f0f1a] border border-[#1e2d50] rounded px-2 py-1.5 text-white text-sm" />
+                </div>
+                <div>
+                  <label className="block text-[10px] text-gray-400 mb-1" title="eom = Excess of Mass (balanced). leaf = finer-grained clusters.">selection</label>
+                  <select value={form.clusterSelection} onChange={(e) => patch({ clusterSelection: e.target.value as 'eom' | 'leaf' })}
+                    className="w-full bg-[#0f0f1a] border border-[#1e2d50] rounded px-2 py-1.5 text-white text-sm">
+                    <option value="eom">eom</option>
+                    <option value="leaf">leaf</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            <div className="text-[11px] text-gray-500 pt-2">
+              {sidecarOk === null ? 'Checking sidecar…' : sidecarOk
+                ? <span className="text-emerald-300">Sidecar connected · OpenAI key {apiKeySet ? 'set ✓' : 'MISSING ✗'}</span>
+                : <span className="text-red-300">Sidecar not running. Start with <code className="bg-[#0f0f1a] px-1 rounded">python playground_server.py</code></span>}
+            </div>
+            <div className="flex gap-2">
+              <button onClick={handleRun}
+                disabled={running || sidecarOk === false || apiKeySet === false}
+                className="bg-cyan-600 hover:bg-cyan-500 disabled:bg-cyan-900 disabled:text-gray-500 disabled:cursor-not-allowed text-white text-sm font-semibold px-5 py-2.5 rounded flex items-center gap-2">
+                {running ? (
+                  <><span className="animate-spin inline-block w-4 h-4 border-2 border-white border-t-transparent rounded-full"></span>
+                  Running… <span className="text-xs font-normal opacity-80">({runElapsed}s)</span></>
+                ) : <>▶ Run Density Clustering</>}
+              </button>
+              <button onClick={loadList}
+                className="bg-[#0f0f1a] hover:bg-[#1a2a4a] text-gray-300 text-sm font-semibold px-4 py-2 rounded border border-[#1e2d50]">
+                ↻ Refresh
+              </button>
+            </div>
+            {runError && (
+              <div className="bg-red-950/40 border border-red-700/50 text-red-200 text-xs p-3 rounded">
+                <strong>Run failed:</strong> {runError}
+              </div>
+            )}
+            {runLog.length > 0 && (
+              <div className="bg-[#0f0f1a] border border-cyan-700/40 rounded max-h-48 overflow-auto p-2 text-[10px] font-mono">
+                {runLog.map((l, i) => (
+                  <div key={i} className={
+                    l.level === 'err' ? 'text-red-300' :
+                    l.level === 'warn' ? 'text-amber-300' :
+                    l.level === 'ok' ? 'text-emerald-300' : 'text-gray-400'
+                  }>
+                    <span className="text-gray-600">{l.ts}</span> {l.msg}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="bg-[#16213e] p-5 rounded-lg border border-cyan-900/40">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-white font-bold">Past Density Runs</h3>
+            <span className="text-[10px] text-gray-500">project: <code>{currentShortId || '—'}</code></span>
+          </div>
+          {experiments.length === 0 ? (
+            <div className="text-xs text-gray-500 py-4">
+              No density runs for this project yet. Configure + run on the left.
+            </div>
+          ) : (
+            <div className="space-y-2 max-h-[60vh] overflow-y-auto">
+              {activeExpId && (
+                <div className="text-[11px] text-amber-300 bg-amber-950/30 border border-amber-700/40 rounded px-2 py-1.5 flex items-center gap-2">
+                  <span>⭐</span>
+                  <span className="flex-1 min-w-0 truncate">
+                    Primary for <code className="text-amber-200">{currentShortId}</code>: <strong>{activeExpId}</strong>
+                  </span>
+                  <button onClick={handleClearPrimary}
+                    className="text-[10px] text-amber-200 hover:text-white underline flex-shrink-0">Revert</button>
+                </div>
+              )}
+              {experiments.map((e) => {
+                const isSelected = selectedExp?.id === e.id;
+                const isActive = activeExpId === e.id;
+                const s = e.stats as { silhouette?: number; noisePct?: number; avgClusterSize?: number; multiClusters: number; singletons: number; finalUnique: number };
+                return (
+                  <div key={e.id}
+                    className={`p-3 rounded border-l-4 ${
+                      isActive ? 'border-amber-400' : 'border-cyan-500'
+                    } ${isSelected ? 'bg-cyan-900/30 ring-1 ring-cyan-500' : 'bg-[#0f0f1a] hover:bg-[#1a2a4a]'}`}>
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex-1 min-w-0 cursor-pointer" onClick={() => openExperiment(e.id)}>
+                        <div className="text-sm text-white font-semibold truncate flex items-center gap-1.5">
+                          {isActive && <span className="text-amber-300" title="Primary">⭐</span>}
+                          <span className="text-[9px] font-bold text-cyan-300 bg-cyan-950/60 border border-cyan-700/60 rounded px-1 py-0.5">DENSITY</span>
+                          <span className="truncate">{e.name}</span>
+                        </div>
+                        <div className="text-[11px] text-gray-500 font-mono truncate">{e.id}</div>
+                      </div>
+                      <button onClick={(ev) => { ev.stopPropagation(); handleDelete(e.id); }}
+                        className="text-xs text-red-400 hover:text-red-300 flex-shrink-0">✕</button>
+                    </div>
+                    <div className="text-xs mt-1 flex items-center justify-between gap-2">
+                      <div className="cursor-pointer flex-1 min-w-0" onClick={() => openExperiment(e.id)}>
+                        <span className="text-emerald-300">{s.multiClusters}</span>{' '}
+                        <span className="text-gray-500">clusters ·</span>{' '}
+                        <span className="text-slate-300">{s.singletons}</span>{' '}
+                        <span className="text-gray-500">noise ·</span>{' '}
+                        {s.silhouette != null && (
+                          <>
+                            <span className={s.silhouette >= 0.35 ? 'text-emerald-300' : s.silhouette >= 0.2 ? 'text-amber-300' : 'text-red-300'}>
+                              silhouette {s.silhouette.toFixed(2)}
+                            </span>{' '}
+                            <span className="text-gray-500">·</span>{' '}
+                          </>
+                        )}
+                        {s.avgClusterSize != null && (
+                          <span className="text-gray-500">avg {s.avgClusterSize}/cluster</span>
+                        )}
+                      </div>
+                      {isActive ? (
+                        <span className="text-[10px] font-bold text-amber-300 bg-amber-950/40 border border-amber-700/60 rounded px-2 py-0.5 flex-shrink-0">PRIMARY</span>
+                      ) : (
+                        <button onClick={(ev) => { ev.stopPropagation(); handleMakePrimary(e.id); }}
+                          className="text-[10px] text-amber-300 hover:text-amber-100 border border-amber-700/50 hover:border-amber-500 rounded px-2 py-0.5 flex-shrink-0">
+                          Make Primary
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {selectedExp && (
+        <div className="bg-[#16213e] p-5 rounded-lg border border-cyan-700/50">
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <h3 className="text-lg text-white font-bold">{selectedExp.name}</h3>
+              <div className="text-xs text-gray-500 font-mono">{selectedExp.id}</div>
+            </div>
+            <button onClick={closeExperiment} className="text-gray-400 hover:text-white text-xl leading-none">×</button>
+          </div>
+
+          <div className="grid grid-cols-6 gap-3 mb-4">
+            {(() => {
+              const s = selectedExp.stats as { inputReports: number; multiClusters: number; singletons: number; noisePct?: number; avgClusterSize?: number; silhouette?: number };
+              const cards: Array<[string, string | number, string]> = [
+                ['Input reports', s.inputReports?.toLocaleString() ?? '—', 'border-blue-500'],
+                ['Clusters', s.multiClusters?.toLocaleString() ?? '—', 'border-emerald-500'],
+                ['Noise points', s.singletons?.toLocaleString() ?? '—', 'border-slate-500'],
+                ['Noise %', s.noisePct != null ? `${(s.noisePct * 100).toFixed(1)}%` : '—', 'border-amber-500'],
+                ['Avg cluster size', s.avgClusterSize?.toLocaleString() ?? '—', 'border-cyan-500'],
+                ['Silhouette', s.silhouette != null ? s.silhouette.toFixed(3) : '—',
+                  s.silhouette != null && s.silhouette >= 0.35 ? 'border-emerald-500' :
+                  s.silhouette != null && s.silhouette >= 0.2 ? 'border-amber-500' : 'border-red-500'],
+              ];
+              return cards.map(([label, val, cls]) => (
+                <div key={label} className={`bg-[#0f0f1a] p-3 rounded border-l-4 ${cls}`}>
+                  <div className="text-[10px] text-gray-400 uppercase">{label}</div>
+                  <div className="text-lg font-bold text-white">{val}</div>
+                </div>
+              ));
+            })()}
+          </div>
+
+          {selectedExp.viz && selectedExp.viz.scatter.length > 0 && (
+            <ExperimentGraphView exp={selectedExp} onClusterClick={setSelectedClusterId} />
+          )}
+
+          <div className="text-xs text-gray-400 uppercase mb-2">
+            Clusters <span className="text-gray-600">({selectedExp.clusters.length} · click any to expand)</span>
+          </div>
+          <div className="space-y-1 max-h-[60vh] overflow-y-auto pr-1">
+            {selectedExp.clusters.slice(0, 200).map((c) => {
+              const isOpen = selectedClusterId === c.id;
+              const primaryRec = reportById.get(c.primaryReportId);
+              // Pin the primary at the top; sort the rest by executions desc.
+              const ordered = [
+                c.primaryReportId,
+                ...c.memberIds
+                  .filter((mid) => mid !== c.primaryReportId)
+                  .sort((a, b) => (reportById.get(b)?.executions ?? 0) - (reportById.get(a)?.executions ?? 0)),
+              ];
+              return (
+                <div key={c.id} className="bg-[#0f0f1a] rounded border-l-2 border-cyan-700/50 text-sm">
+                  <div className="p-2 cursor-pointer hover:bg-[#1a2a4a]"
+                    onClick={() => setSelectedClusterId(isOpen ? null : c.id)}>
+                    <div className="flex items-center gap-3">
+                      <span className="text-gray-500 text-xs w-3">{isOpen ? '▾' : '▸'}</span>
+                      <span className="font-mono text-cyan-300 text-xs w-14">{c.id}</span>
+                      <span className="text-[9px] font-bold text-amber-300 bg-amber-950/40 border border-amber-700/50 rounded px-1 py-0.5 flex-shrink-0" title="Primary / keep-candidate report of this cluster (highest executions)">
+                        ⭐ PRIMARY
+                      </span>
+                      <FamilySiblingsIndicator siblings={reportById.get(c.primaryReportId)?.familySiblings} />
+                      <span className="text-white truncate flex-1" title={c.primaryReportId}>{c.primaryName || c.primaryReportId || '—'}</span>
+                      <span className="text-gray-400 text-xs whitespace-nowrap">
+                        {c.size} reports · {c.totalExecutions.toLocaleString()} execs
+                      </span>
+                    </div>
+                  </div>
+                  {isOpen && (
+                    <div className="px-4 pb-3 text-xs">
+                      <div className="text-gray-500 mb-2">
+                        The <strong className="text-amber-300">⭐ primary</strong> is the keep-candidate — the highest-executions
+                        report in the cluster. The other {Math.max(0, c.size - 1)} are consolidation candidates.
+                      </div>
+                      <div className="grid grid-cols-[auto_1fr_auto] gap-x-3 gap-y-0.5">
+                        <div className="text-[10px] uppercase text-gray-600 font-semibold">Role</div>
+                        <div className="text-[10px] uppercase text-gray-600 font-semibold">Report</div>
+                        <div className="text-[10px] uppercase text-gray-600 font-semibold text-right">Execs</div>
+                        {ordered.slice(0, 50).map((mid) => {
+                          const r = reportById.get(mid);
+                          const isPrimary = mid === c.primaryReportId;
+                          return (
+                            <div key={mid} className={`contents ${isPrimary ? 'font-semibold' : ''}`}>
+                              <div className={`text-[10px] whitespace-nowrap flex items-center gap-1 ${isPrimary ? 'text-amber-300' : 'text-gray-600'}`}>
+                                {isPrimary ? '⭐ PRIMARY' : '• member'}
+                                <FamilySiblingsIndicator siblings={r?.familySiblings} />
+                              </div>
+                              <div className="truncate">
+                                <span className={isPrimary ? 'text-amber-100' : 'text-gray-300'} title={mid}>
+                                  {r?.name || mid}
+                                </span>
+                                {r?.path && <span className="text-gray-600 ml-2">{r.path}</span>}
+                              </div>
+                              <div className={`font-mono text-right ${isPrimary ? 'text-amber-200' : 'text-gray-500'}`}>
+                                {r?.executions?.toLocaleString() ?? '—'}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                      {c.size > 50 && (
+                        <div className="text-[10px] text-gray-500 mt-2">
+                          Showing first 50 of {c.size} members.
+                        </div>
+                      )}
+                      {!primaryRec && c.primaryReportId && (
+                        <div className="text-[10px] text-amber-400 mt-2">
+                          Primary report {c.primaryReportId} isn't in the current reports.json view — may be filtered/retired.
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// EXPERIMENT GRAPH VIEW — 2D scatter + threshold slider + hover tooltip
+// ─────────────────────────────────────────────────────────────────────
+
+// Deterministic pastel color derived from a cluster id string so dots from
+// the same cluster match across renders. Singletons get a muted gray.
+function _clusterColor(cid: string | null | undefined): string {
+  if (!cid) return '#475569'; // slate-600 for singletons
+  let h = 0;
+  for (let i = 0; i < cid.length; i++) {
+    h = ((h << 5) - h) + cid.charCodeAt(i);
+    h = h & h;
+  }
+  const hue = Math.abs(h) % 360;
+  return `hsl(${hue}, 65%, 60%)`;
+}
+
+function ExperimentGraphView({
+  exp,
+  onClusterClick,
+}: {
+  exp: PlaygroundExperiment;
+  onClusterClick: (id: string) => void;
+}) {
+  const viz = exp.viz!;
+  const runThreshold = viz.thresholdUsed;
+
+  const [liveThreshold, setLiveThreshold] = useState<number>(runThreshold);
+  const [hoverId, setHoverId] = useState<string | null>(null);
+  const [hoverXY, setHoverXY] = useState<{ x: number; y: number } | null>(null);
+  const [selectedClusterViz, setSelectedClusterViz] = useState<string | null>(null);
+  const [showEdges, setShowEdges] = useState(true);
+
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const WIDTH = 720;
+  const HEIGHT = 420;
+  const PAD = 20;
+  const toX = (x: number) => PAD + x * (WIDTH - 2 * PAD);
+  const toY = (y: number) => PAD + y * (HEIGHT - 2 * PAD);
+
+  // Recompute cluster assignment + edges at the live threshold.
+  // When the slider is at the run threshold we trust the backend's
+  // authoritative assignments (from `scatter[].clusterId`). topPairs is a
+  // truncated sample, so re-running union-find on it produces wildly wrong
+  // cluster counts — e.g. for experiments with >>50k edges, the sample keeps
+  // only the strongest cosines and misses the marginal pairs that perform
+  // most merges.
+  const atRunThreshold = Math.abs(liveThreshold - runThreshold) < 1e-6;
+
+  const { clusterByRid, multiCount, singletonCount, edgeCount, edgesToDraw, isApproximate } = useMemo(() => {
+    const scatterMap = new Map(viz.scatter.map((p) => [p.id, p]));
+
+    if (atRunThreshold) {
+      // Trust backend. Use stored clusterId per scatter point.
+      const map = new Map<string, string | null>();
+      const rootSize = new Map<string, number>();
+      for (const p of viz.scatter) {
+        map.set(p.id, p.clusterId ?? null);
+        if (p.clusterId) {
+          rootSize.set(p.clusterId, (rootSize.get(p.clusterId) || 0) + 1);
+        }
+      }
+      let singles = 0;
+      for (const p of viz.scatter) if (!p.clusterId) singles++;
+      // Edge draw list (just a visual aid; capped)
+      const edgesFull: Array<[PlaygroundVizPoint, PlaygroundVizPoint, number]> = [];
+      for (const [a, b, s] of viz.topPairs) {
+        if (s < liveThreshold) continue;
+        const pa = scatterMap.get(a), pb = scatterMap.get(b);
+        if (pa && pb && edgesFull.length < 4000) edgesFull.push([pa, pb, s]);
+        if (edgesFull.length >= 4000) break;
+      }
+      return {
+        clusterByRid: map,
+        multiCount: rootSize.size,
+        singletonCount: singles,
+        edgeCount: exp.stats.edges ?? viz.topPairs.length,
+        edgesToDraw: edgesFull,
+        isApproximate: false,
+      };
+    }
+
+    // Live re-cluster on truncated topPairs (approximation — flag it).
+    const parent = new Map<string, string>();
+    viz.scatter.forEach((p) => parent.set(p.id, p.id));
+    const find = (x: string): string => {
+      let r = x;
+      while (parent.get(r)! !== r) r = parent.get(r)!;
+      let cur = x;
+      while (parent.get(cur)! !== r) {
+        const next = parent.get(cur)!;
+        parent.set(cur, r);
+        cur = next;
+      }
+      return r;
+    };
+    const union = (a: string, b: string) => {
+      const ra = find(a), rb = find(b);
+      if (ra !== rb) parent.set(ra, rb);
+    };
+    let edgeN = 0;
+    const edgesFull: Array<[PlaygroundVizPoint, PlaygroundVizPoint, number]> = [];
+    for (const [a, b, s] of viz.topPairs) {
+      if (s < liveThreshold) continue;
+      union(a, b);
+      edgeN++;
+      const pa = scatterMap.get(a), pb = scatterMap.get(b);
+      if (pa && pb && edgesFull.length < 4000) edgesFull.push([pa, pb, s]);
+    }
+    const rootSize = new Map<string, number>();
+    for (const p of viz.scatter) {
+      const r = find(p.id);
+      rootSize.set(r, (rootSize.get(r) || 0) + 1);
+    }
+    const rootToLabel = new Map<string, string>();
+    let idx = 1;
+    for (const [r, n] of Array.from(rootSize.entries())
+      .filter(([, n]) => n >= 2)
+      .sort((a, b) => b[1] - a[1])) {
+      void n;
+      rootToLabel.set(r, `LC${String(idx).padStart(3, '0')}`);
+      idx++;
+    }
+    const map = new Map<string, string | null>();
+    let singletons = 0;
+    for (const p of viz.scatter) {
+      const r = find(p.id);
+      const label = rootToLabel.get(r) || null;
+      map.set(p.id, label);
+      if (!label) singletons++;
+    }
+    // Approximation only when topPairs was truncated by the backend cap.
+    const truncated = viz.topPairs.length >= 50000 && (exp.stats.edges ?? 0) > viz.topPairs.length;
+    return {
+      clusterByRid: map,
+      multiCount: rootToLabel.size,
+      singletonCount: singletons,
+      edgeCount: edgeN,
+      edgesToDraw: edgesFull,
+      isApproximate: truncated,
+    };
+  }, [viz.topPairs, viz.scatter, liveThreshold, atRunThreshold, runThreshold, exp.stats.edges]);
+
+  // Draw to canvas whenever clusters, threshold, or hover change.
+  useEffect(() => {
+    const c = canvasRef.current;
+    if (!c) return;
+    const ctx = c.getContext('2d');
+    if (!ctx) return;
+
+    // Support high DPI
+    const ratio = window.devicePixelRatio || 1;
+    c.width = WIDTH * ratio;
+    c.height = HEIGHT * ratio;
+    c.style.width = WIDTH + 'px';
+    c.style.height = HEIGHT + 'px';
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+
+    ctx.fillStyle = '#0f0f1a';
+    ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+    // Draw edges
+    if (showEdges) {
+      ctx.globalAlpha = 0.35;
+      for (const [pa, pb, s] of edgesToDraw) {
+        const sameCluster = clusterByRid.get(pa.id) === clusterByRid.get(pb.id);
+        ctx.strokeStyle = _clusterColor(sameCluster ? clusterByRid.get(pa.id) : null);
+        ctx.lineWidth = 0.3 + Math.max(0, s - liveThreshold) * 4;
+        ctx.beginPath();
+        ctx.moveTo(toX(pa.x), toY(pa.y));
+        ctx.lineTo(toX(pb.x), toY(pb.y));
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // Draw dots — clustered last so they pop above singletons
+    const draw = (p: PlaygroundVizPoint, isHover: boolean) => {
+      const cid = clusterByRid.get(p.id);
+      const isSel = selectedClusterViz && cid === selectedClusterViz;
+      const r = isHover ? 5 : (cid ? 3 : 1.8);
+      const op = selectedClusterViz ? (isSel ? 1 : 0.22) : (cid ? 1 : 0.45);
+      ctx.globalAlpha = op;
+      ctx.fillStyle = _clusterColor(cid);
+      ctx.beginPath();
+      ctx.arc(toX(p.x), toY(p.y), r, 0, Math.PI * 2);
+      ctx.fill();
+      if (isSel || isHover) {
+        ctx.globalAlpha = 1;
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = isHover ? 1.5 : 1;
+        ctx.stroke();
+      }
+    };
+    for (const p of viz.scatter) {
+      if (!clusterByRid.get(p.id)) draw(p, p.id === hoverId);
+    }
+    for (const p of viz.scatter) {
+      if (clusterByRid.get(p.id)) draw(p, p.id === hoverId);
+    }
+    ctx.globalAlpha = 1;
+  }, [viz.scatter, clusterByRid, edgesToDraw, hoverId, selectedClusterViz, liveThreshold, showEdges]);
+
+  // Hover + click — nearest-dot lookup on mousemove.
+  function handleMouseMove(ev: React.MouseEvent<HTMLCanvasElement>) {
+    const rect = ev.currentTarget.getBoundingClientRect();
+    const mx = ev.clientX - rect.left;
+    const my = ev.clientY - rect.top;
+    let best: string | null = null;
+    let bestD = 36; // 6px radius
+    for (const p of viz.scatter) {
+      const dx = toX(p.x) - mx;
+      const dy = toY(p.y) - my;
+      const d = dx * dx + dy * dy;
+      if (d < bestD) { bestD = d; best = p.id; }
+    }
+    setHoverId(best);
+    setHoverXY(best ? { x: mx, y: my } : null);
+  }
+
+  function handleClick() {
+    if (!hoverId) {
+      setSelectedClusterViz(null);
+      return;
+    }
+    const cid = clusterByRid.get(hoverId);
+    if (!cid) return;
+    setSelectedClusterViz((s) => (s === cid ? null : cid));
+    const match = exp.clusters.find((c) => c.memberIds.includes(hoverId));
+    if (match) onClusterClick(match.id);
+  }
+
+  const hoverPoint = hoverId ? viz.scatter.find((p) => p.id === hoverId) : null;
+
+  return (
+    <div className="bg-[#0f0f1a] border border-fuchsia-700/40 rounded-lg p-4 mb-4">
+      <div className="flex items-center justify-between mb-3">
+        <div>
+          <h4 className="text-sm font-bold text-fuchsia-200">📊 Graph View — embedding space</h4>
+          <div className="text-[10px] text-gray-500 mt-0.5">
+            Each dot is a report; position is a 2D projection (PCA) of its {(exp.config.dimensions as number) || 3072}-dim embedding.
+            Same-color dots share a cluster at the current threshold. Drag the threshold slider below to watch clusters form and dissolve live.
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <label className="flex items-center gap-1.5 text-xs text-gray-400 cursor-pointer">
+            <input type="checkbox" checked={showEdges} onChange={(e) => setShowEdges(e.target.checked)} />
+            edges
+          </label>
+        </div>
+      </div>
+
+      <div className="flex items-center gap-3 mb-3">
+        <span className="text-xs text-gray-400 whitespace-nowrap">Threshold:</span>
+        <input type="range" min={0.50} max={0.99} step={0.01}
+          value={liveThreshold}
+          onChange={(e) => setLiveThreshold(parseFloat(e.target.value))}
+          className="flex-1 accent-fuchsia-500" />
+        <span className="font-mono text-sm text-fuchsia-300 w-14 text-right">{liveThreshold.toFixed(2)}</span>
+        <button
+          onClick={() => setLiveThreshold(runThreshold)}
+          className="text-[10px] text-gray-400 hover:text-white px-2 py-1 bg-[#16213e] rounded border border-[#1e2d50]"
+          title={`Reset to the threshold this experiment was run at (${runThreshold.toFixed(2)})`}
+        >
+          ↺ {runThreshold.toFixed(2)}
+        </button>
+      </div>
+
+      <div className="flex items-center gap-3 text-xs text-gray-400 mb-2 flex-wrap">
+        <span><strong className="text-fuchsia-300">{multiCount}</strong> multi-clusters</span>
+        <span>·</span>
+        <span><strong className="text-slate-300">{singletonCount}</strong> singletons</span>
+        <span>·</span>
+        <span><strong className="text-amber-300">{multiCount + singletonCount}</strong> final unique</span>
+        <span>·</span>
+        <span><strong className="text-white">{edgeCount.toLocaleString()}</strong> edges &#8805; {liveThreshold.toFixed(2)}</span>
+        <span>· <strong className="text-gray-300">{viz.scatter.length.toLocaleString()}</strong> dots</span>
+        {liveThreshold !== runThreshold && (
+          <span className="ml-auto text-[10px] text-amber-400">
+            {isApproximate
+              ? `⚠ approx · only top ${viz.topPairs.length.toLocaleString()} of ${(exp.stats.edges ?? 0).toLocaleString()} edges sampled`
+              : '⚡ live re-cluster (not saved)'}
+          </span>
+        )}
+      </div>
+
+      <div ref={containerRef} className="relative bg-[#0f0f1a] border border-[#1e2d50] rounded overflow-hidden inline-block">
+        <canvas
+          ref={canvasRef}
+          onMouseMove={handleMouseMove}
+          onMouseLeave={() => { setHoverId(null); setHoverXY(null); }}
+          onClick={handleClick}
+          style={{ cursor: hoverPoint && clusterByRid.get(hoverPoint.id) ? 'pointer' : 'default' }}
+        />
+        {hoverPoint && hoverXY && (
+          <div
+            className="absolute bg-[#16213e] border border-fuchsia-700 rounded px-2 py-1.5 text-xs pointer-events-none shadow-lg max-w-[320px] z-10"
+            style={{
+              left: Math.min(WIDTH - 300, hoverXY.x + 10),
+              top: Math.min(HEIGHT - 60, hoverXY.y + 10),
+            }}
+          >
+            <div className="text-white font-semibold truncate">{hoverPoint.name || hoverPoint.id.slice(0, 12)}</div>
+            <div className="text-[10px] text-gray-400 mt-0.5 flex items-center gap-2">
+              <span className="inline-block w-2 h-2 rounded-full" style={{ background: _clusterColor(clusterByRid.get(hoverPoint.id)) }}></span>
+              <span>{clusterByRid.get(hoverPoint.id) || '(singleton)'}</span>
+              <span>· {hoverPoint.executions.toLocaleString()} execs</span>
+            </div>
+          </div>
+        )}
+        {selectedClusterViz && (
+          <div className="absolute bottom-2 right-2 bg-fuchsia-900/70 border border-fuchsia-600 rounded px-2 py-1 text-[10px] text-fuchsia-100">
+            focused on <strong>{selectedClusterViz}</strong> · click empty area to reset
+          </div>
+        )}
+      </div>
+
+      <div className="mt-3 text-[10px] text-gray-500 leading-relaxed">
+        Canvas-rendered so the slider stays smooth even at 5,000+ reports. Dot color = cluster at the
+        current threshold. Gray = singletons. The 2D projection (PCA) preserves rough similarity —
+        nearby dots embed to similar vectors — but distance in the plot isn't exact cosine. Edges show
+        the actual pairwise cosine graph. Click a colored dot to focus its cluster and scroll to it below.
       </div>
     </div>
   );
@@ -2063,14 +6480,18 @@ function ClusterModal({
 }) {
   const [selectedForCompare, setSelectedForCompare] = useState<string[]>([]);
 
-  const members = useMemo(
-    () =>
-      cluster.memberIds
-        .map((id) => reportById.get(id))
-        .filter((r): r is ReportDetail => !!r)
-        .sort((a, b) => b.executions - a.executions),
-    [cluster, reportById]
-  );
+  const members = useMemo(() => {
+    const list = cluster.memberIds
+      .map((id) => reportById.get(id))
+      .filter((r): r is ReportDetail => !!r);
+    const primary = list.find((r) => r.id === cluster.primaryReportId);
+    const rest = list
+      .filter((r) => r.id !== cluster.primaryReportId)
+      .sort((a, b) => b.executions - a.executions);
+    return primary ? [primary, ...rest] : rest;
+  }, [cluster, reportById]);
+
+  const sqlCount = useMemo(() => members.filter((m) => !!m.sql).length, [members]);
 
   function toggleSelect(id: string) {
     if (selectedForCompare.includes(id)) {
@@ -2106,8 +6527,22 @@ function ClusterModal({
           <div>
             <div className="text-xs text-gray-500 mb-1 font-mono">{cluster.id}</div>
             <h2 className="text-xl font-bold text-white">{cluster.primaryName}</h2>
-            <div className="text-sm text-gray-400 mt-1">
-              {cluster.size} reports · {cluster.totalExecutions.toLocaleString()} total executions
+            <div className="text-sm text-gray-400 mt-1 flex items-center gap-3 flex-wrap">
+              <span>
+                {cluster.size} reports · {cluster.totalExecutions.toLocaleString()} total executions
+              </span>
+              <span
+                className={`text-xs px-2 py-0.5 rounded font-semibold ${
+                  sqlCount === members.length
+                    ? 'bg-emerald-900/50 text-emerald-300 border border-emerald-700/50'
+                    : sqlCount === 0
+                    ? 'bg-gray-800/60 text-gray-400 border border-gray-700/50'
+                    : 'bg-amber-900/40 text-amber-300 border border-amber-700/50'
+                }`}
+                title="Count of members with successfully extracted SQL"
+              >
+                SQL: {sqlCount} / {members.length}
+              </span>
             </div>
           </div>
           <button
@@ -2143,7 +6578,10 @@ function ClusterModal({
             <thead className="bg-[#0f0f1a]">
               <tr>
                 <th className="text-left p-2 text-xs text-gray-400 uppercase w-8"></th>
+                <th className="text-left p-2 text-xs text-gray-400 uppercase w-24">Role</th>
                 <th className="text-left p-2 text-xs text-gray-400 uppercase">Report Name</th>
+                <th className="text-left p-2 text-xs text-gray-400 uppercase w-16">Source</th>
+                <th className="text-center p-2 text-xs text-gray-400 uppercase w-16">SQL</th>
                 <th className="text-right p-2 text-xs text-gray-400 uppercase">Execs</th>
                 <th className="text-right p-2 text-xs text-gray-400 uppercase">Users</th>
                 <th className="text-left p-2 text-xs text-gray-400 uppercase">Last Exec</th>
@@ -2152,12 +6590,16 @@ function ClusterModal({
             <tbody>
               {members.map((r) => {
                 const isSelected = selectedForCompare.includes(r.id);
+                const hasSql = !!r.sql;
+                const isPrimary = r.id === cluster.primaryReportId;
                 return (
                   <tr
                     key={r.id}
                     onClick={() => toggleSelect(r.id)}
                     className={`border-t border-[#1e2d50] cursor-pointer ${
-                      isSelected ? 'bg-blue-900/30' : 'hover:bg-[#1a2a4a]'
+                      isSelected ? 'bg-blue-900/30'
+                        : isPrimary ? 'bg-amber-950/30 hover:bg-amber-900/30'
+                        : 'hover:bg-[#1a2a4a]'
                     }`}
                   >
                     <td className="p-2">
@@ -2168,8 +6610,39 @@ function ClusterModal({
                         className="accent-blue-500"
                       />
                     </td>
-                    <td className="p-2 text-white">{r.name}</td>
-                    <td className="p-2 text-right font-mono text-gray-300">
+                    <td className="p-2">
+                      <div className="flex items-center gap-1 flex-wrap">
+                        {isPrimary ? (
+                          <span className="text-[10px] font-bold text-amber-300 bg-amber-950/50 border border-amber-700/60 rounded px-1.5 py-0.5 whitespace-nowrap"
+                            title="Keep-candidate — the primary report of this cluster">
+                            ⭐ PRIMARY
+                          </span>
+                        ) : (
+                          <span className="text-[10px] text-gray-500">member</span>
+                        )}
+                        <FamilySiblingsIndicator siblings={r.familySiblings} />
+                      </div>
+                    </td>
+                    <td className={`p-2 ${isPrimary ? 'text-amber-100 font-semibold' : 'text-white'}`}>{r.name}</td>
+                    <td className="p-2"><SourceTypePill sourceType={r.sourceType} /></td>
+                    <td className="p-2 text-center">
+                      {hasSql ? (
+                        <span
+                          className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-300 bg-emerald-900/40 border border-emerald-700/50 px-2 py-0.5 rounded"
+                          title="SQL successfully extracted"
+                        >
+                          {'\u2713'} Yes
+                        </span>
+                      ) : (
+                        <span
+                          className="inline-flex items-center gap-1 text-xs font-semibold text-gray-400 bg-gray-800/60 border border-gray-700/50 px-2 py-0.5 rounded"
+                          title={r.sqlError || 'SQL not available for this report'}
+                        >
+                          {'\u2014'} No
+                        </span>
+                      )}
+                    </td>
+                    <td className={`p-2 text-right font-mono ${isPrimary ? 'text-amber-200' : 'text-gray-300'}`}>
                       {r.executions.toLocaleString()}
                     </td>
                     <td className="p-2 text-right font-mono text-gray-300">{r.users}</td>
@@ -2326,6 +6799,7 @@ function FamilyModal({
                 <th className="text-left p-2 text-xs text-gray-400 uppercase w-8"></th>
                 <th className="text-left p-2 text-xs text-gray-400 uppercase">Variant Suffix</th>
                 <th className="text-left p-2 text-xs text-gray-400 uppercase">Full Name</th>
+                <th className="text-left p-2 text-xs text-gray-400 uppercase w-16">Source</th>
                 <th className="text-center p-2 text-xs text-gray-400 uppercase">SQL</th>
                 <th className="text-right p-2 text-xs text-gray-400 uppercase">Execs</th>
                 <th className="text-right p-2 text-xs text-gray-400 uppercase">Users</th>
@@ -2335,14 +6809,15 @@ function FamilyModal({
             <tbody>
               {visibleMembers.length === 0 && (
                 <tr>
-                  <td colSpan={7} className="p-4 text-center text-xs text-gray-500 italic">
+                  <td colSpan={8} className="p-4 text-center text-xs text-gray-500 italic">
                     No reports match the current SQL filter.
                   </td>
                 </tr>
               )}
               {visibleMembers.map((m, i) => {
                 const isSelected = selectedForCompare.includes(m.id);
-                const hasSql = !!reportById.get(m.id)?.sql;
+                const rd = reportById.get(m.id);
+                const hasSql = !!rd?.sql;
                 return (
                   <tr
                     key={m.id}
@@ -2368,6 +6843,7 @@ function FamilyModal({
                       {i === 0 && <span className="text-xs text-green-400 ml-2">(primary)</span>}
                     </td>
                     <td className="p-2 text-gray-300 text-xs">{m.name}</td>
+                    <td className="p-2"><SourceTypePill sourceType={rd?.sourceType} /></td>
                     <td className="p-2 text-center">
                       <span
                         className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
@@ -2645,6 +7121,7 @@ function SqlHashGroupModal({
               <tr>
                 <th className="text-left p-2 text-xs text-gray-400 uppercase w-8"></th>
                 <th className="text-left p-2 text-xs text-gray-400 uppercase">Name</th>
+                <th className="text-left p-2 text-xs text-gray-400 uppercase w-16">Source</th>
                 <th className="text-left p-2 text-xs text-gray-400 uppercase">Path</th>
                 <th className="text-right p-2 text-xs text-gray-400 uppercase">Execs</th>
                 <th className="text-right p-2 text-xs text-gray-400 uppercase">Users</th>
@@ -2654,6 +7131,7 @@ function SqlHashGroupModal({
             <tbody>
               {group.members.map((m, i) => {
                 const isSelected = selectedForCompare.includes(m.id);
+                const rd = reportById.get(m.id);
                 return (
                   <tr
                     key={m.id}
@@ -2669,6 +7147,7 @@ function SqlHashGroupModal({
                       {m.name}
                       {i === 0 && <span className="text-xs text-green-400 ml-2">(primary)</span>}
                     </td>
+                    <td className="p-2"><SourceTypePill sourceType={rd?.sourceType} /></td>
                     <td className="p-2 text-gray-500 text-xs truncate max-w-xs" title={m.path}>{m.path}</td>
                     <td className="p-2 text-right font-mono text-gray-300">{m.executions.toLocaleString()}</td>
                     <td className="p-2 text-right font-mono text-gray-300">{m.users}</td>
@@ -3124,10 +7603,15 @@ function ReportListModal({
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | 'active' | 'retired' | 'collapsed'>('all');
   const [bucketFilter, setBucketFilter] = useState<'all' | 'original' | 'new' | 'added'>('all');
+  const [srcFilter, setSrcFilter] = useState<'all' | 'normal' | 'cube' | 'custom_sql_free_form' | 'none'>('all');
 
   const filtered = (data || []).filter((r) => {
     if (kind === 'inventory' && statusFilter !== 'all' && r.status !== statusFilter) return false;
     if (kind === 'retired' && bucketFilter !== 'all' && r.bucket !== bucketFilter) return false;
+    if (srcFilter !== 'all') {
+      const src = (r.sourceType || '').trim();
+      if (srcFilter === 'none' ? src !== '' : src !== srcFilter) return false;
+    }
     if (search) {
       const q = search.toLowerCase();
       return (
@@ -3139,6 +7623,15 @@ function ReportListModal({
     }
     return true;
   });
+
+  // Counts per source type for the dropdown labels
+  const srcCounts = data ? {
+    all: data.length,
+    normal: data.filter((r) => (r.sourceType || '') === 'normal').length,
+    cube: data.filter((r) => (r.sourceType || '') === 'cube').length,
+    custom_sql_free_form: data.filter((r) => (r.sourceType || '') === 'custom_sql_free_form').length,
+    none: data.filter((r) => (r.sourceType || '').trim() === '').length,
+  } : null;
 
   // Show counts by status for inventory
   const statusCounts = kind === 'inventory' && data ? {
@@ -3244,6 +7737,20 @@ function ReportListModal({
                 ))}
               </div>
             )}
+            {srcCounts && (
+              <select
+                value={srcFilter}
+                onChange={(e) => setSrcFilter(e.target.value as typeof srcFilter)}
+                className="bg-[#0f0f1a] border border-[#1e2d50] rounded-lg px-3 py-2 text-white text-xs focus:outline-none"
+                title="Filter by report source type"
+              >
+                <option value="all">Source: All ({srcCounts.all.toLocaleString()})</option>
+                <option value="normal">Source: SQL ({srcCounts.normal.toLocaleString()})</option>
+                <option value="cube">Source: Cube ({srcCounts.cube.toLocaleString()})</option>
+                <option value="custom_sql_free_form">Source: Free SQL ({srcCounts.custom_sql_free_form.toLocaleString()})</option>
+                <option value="none">Source: Unknown ({srcCounts.none.toLocaleString()})</option>
+              </select>
+            )}
           </div>
 
           {loading && (
@@ -3270,6 +7777,7 @@ function ReportListModal({
                 <thead className="bg-[#0f0f1a] sticky top-0">
                   <tr>
                     <th className="text-left p-2 text-[10px] text-gray-400 uppercase">Name</th>
+                    <th className="text-left p-2 text-[10px] text-gray-400 uppercase w-16">Source</th>
                     <th className="text-left p-2 text-[10px] text-gray-400 uppercase">Owner</th>
                     <th className="text-left p-2 text-[10px] text-gray-400 uppercase">Path</th>
                     {kind === 'inventory' && (
@@ -3295,6 +7803,7 @@ function ReportListModal({
                   {filtered.slice(0, 5000).map((r) => (
                     <tr key={r.id} className="border-t border-[#1e2d50] hover:bg-[#1a2a4a]">
                       <td className="p-2 text-white">{r.name}</td>
+                      <td className="p-2"><SourceTypePill sourceType={r.sourceType} /></td>
                       <td className="p-2 text-gray-400">{r.owner || '-'}</td>
                       <td className="p-2 text-gray-500 truncate max-w-[280px]" title={r.path}>
                         {r.path || '-'}
@@ -3393,6 +7902,7 @@ function LlmReviewTab({
   actionFilter,
   setActionFilter,
   summary,
+  semanticClusters,
   onOpen,
 }: {
   reviews: LlmReview[];
@@ -3402,6 +7912,7 @@ function LlmReviewTab({
   actionFilter: string;
   setActionFilter: (v: string) => void;
   summary: RationalizationSummary | null;
+  semanticClusters: SemanticCluster[];
   onOpen: (r: LlmReview) => void;
 }) {
   const byAction = summary?.llmReviewsByAction || {};
@@ -3409,7 +7920,148 @@ function LlmReviewTab({
   const safeClusters = summary?.llmSafeClusters ?? 0;
   const totalClusters = summary?.llmReviewsTotal ?? 0;
 
+  // Semantic-path stats for the lineage banner
+  const semMulti = semanticClusters.filter((c) => !c.isSingletons);
+  const semReviewed = semMulti.filter((c) => c.llm && !c.llm.error).length;
+  const semRemovable = semMulti.reduce((s, c) => s + ((c.llm?.removableCount) || 0), 0);
+
   return (
+    <div className="space-y-4">
+      {/* Pipeline lineage banner — LLM Review sits on top of BOTH clustering branches */}
+      {summary && (
+        <div className="bg-gradient-to-r from-indigo-950/60 to-[#16213e] p-4 rounded-lg border border-indigo-800/40">
+          <div className="text-xs uppercase tracking-wider text-indigo-300 font-bold mb-2">
+            Pipeline Lineage — LLM Review Sits Above the Clustering Layer
+          </div>
+          <div className="flex items-center gap-2 text-sm flex-wrap">
+            <span className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]">
+              <span className="text-gray-400">Inventory:</span>{' '}
+              <span className="font-bold text-white">{summary.totalInventory.toLocaleString()}</span>
+            </span>
+            <span className="text-gray-500">{'\u2192'}</span>
+            <span className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]">
+              <span className="text-gray-400">After telemetry:</span>{' '}
+              <span className="font-bold text-white">{summary.afterTelemetry.toLocaleString()}</span>
+            </span>
+            {summary.afterCollisionCollapse !== undefined && (
+              <>
+                <span className="text-gray-500">{'\u2192'}</span>
+                <span className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]">
+                  <span className="text-gray-400">Collision:</span>{' '}
+                  <span className="font-bold text-white">{summary.afterCollisionCollapse.toLocaleString()}</span>
+                </span>
+              </>
+            )}
+            <span className="text-gray-500">{'\u2192'}</span>
+            <span className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]">
+              <span className="text-gray-400">Fingerprint:</span>{' '}
+              <span className="font-bold text-white">{summary.afterFingerprint?.toLocaleString() ?? '-'}</span>
+            </span>
+            {summary.afterSqlHash !== undefined && (
+              <>
+                <span className="text-gray-500">{'\u2192'}</span>
+                <span className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]">
+                  <span className="text-blue-300">SQL Hash:</span>{' '}
+                  <span className="font-bold text-white">{summary.afterSqlHash.toLocaleString()}</span>
+                </span>
+              </>
+            )}
+            {summary.afterAst !== undefined && (
+              <>
+                <span className="text-gray-500">{'\u2192'}</span>
+                <span className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]">
+                  <span className="text-pink-300">After AST:</span>{' '}
+                  <span className="font-bold text-white">{summary.afterAst.toLocaleString()}</span>
+                </span>
+              </>
+            )}
+            {summary.afterPostAstFamily !== undefined && (
+              <>
+                <span className="text-gray-500">{'\u2192'}</span>
+                <span
+                  className="px-3 py-1.5 bg-orange-900/20 rounded border border-orange-700/50"
+                  title="Post-AST Family collapse — name-sibling canonicals merged. Input to both clustering branches."
+                >
+                  <span className="text-orange-300">After Family (clustering input):</span>{' '}
+                  <span className="font-bold text-white">{summary.afterPostAstFamily.toLocaleString()}</span>
+                  {summary.postAstFamilyCollapsed !== undefined && summary.postAstFamilyCollapsed > 0 && (
+                    <span className="text-green-400 text-xs ml-1">({'\u2212'}{summary.postAstFamilyCollapsed.toLocaleString()})</span>
+                  )}
+                </span>
+              </>
+            )}
+          </div>
+
+          {/* Two-branch visualization */}
+          <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3">
+            {/* Primary path — Semantic + its own LLM */}
+            <div className="p-3 rounded border border-teal-700/50 bg-teal-950/30">
+              <div className="text-[10px] uppercase tracking-wider text-teal-300 font-bold mb-2">
+                Primary path — Semantic clustering + inline LLM
+              </div>
+              <div className="flex items-center gap-2 text-xs flex-wrap">
+                <span className="text-gray-500">post-AST-family</span>
+                <span className="font-mono text-gray-500">{'\u2192'}</span>
+                <span className="px-2 py-1 bg-[#0f0f1a] rounded border border-teal-700/50">
+                  <span className="text-teal-300">Semantic clusters:</span>{' '}
+                  <span className="text-white font-semibold">{semMulti.length.toLocaleString()}</span>
+                </span>
+                <span className="font-mono text-gray-500">{'\u2192'}</span>
+                <span className="px-2 py-1 bg-[#0f0f1a] rounded border border-teal-700/50">
+                  <span className="text-teal-300">LLM reviewed:</span>{' '}
+                  <span className="text-white font-semibold">{semReviewed.toLocaleString()}</span>
+                </span>
+                {semRemovable > 0 && (
+                  <span className="px-2 py-1 bg-green-900/40 rounded border border-green-700/60 text-green-200">
+                    LLM-removable: <span className="font-semibold text-white">−{semRemovable.toLocaleString()}</span>
+                  </span>
+                )}
+              </div>
+              <div className="text-[10px] text-gray-500 mt-1">
+                Reviews live on the <strong className="text-gray-400">Semantic Clusters</strong> tab
+                (inline per-cluster badge + drill-down).
+              </div>
+            </div>
+
+            {/* Alternative path — Similarity + this LLM Review tab (highlighted) */}
+            <div className="p-3 rounded border border-indigo-600 bg-indigo-900/30 ring-2 ring-indigo-500/40">
+              <div className="text-[10px] uppercase tracking-wider text-indigo-300 font-bold mb-2">
+                Alternative path — Similarity clustering + THIS tab
+              </div>
+              <div className="flex items-center gap-2 text-xs flex-wrap">
+                <span className="text-gray-500">post-AST-family</span>
+                <span className="font-mono text-gray-500">{'\u2192'}</span>
+                <span className="px-2 py-1 bg-[#0f0f1a] rounded border border-indigo-700/60">
+                  <span className="text-indigo-300">After Similarity:</span>{' '}
+                  <span className="text-white font-semibold">{afterSim.toLocaleString()}</span>
+                </span>
+                <span className="font-mono text-gray-500">{'\u2192'}</span>
+                <span className="px-2 py-1 bg-indigo-900/60 rounded border border-indigo-600 ring-1 ring-indigo-500/40">
+                  <span className="text-indigo-200">LLM reviewed:</span>{' '}
+                  <span className="text-white font-semibold">{totalClusters.toLocaleString()}</span>
+                </span>
+                {safeClusters > 0 && (
+                  <span className="px-2 py-1 bg-green-900/40 rounded border border-green-700/60 text-green-200">
+                    Safe-to-auto: <span className="font-semibold text-white">{safeClusters.toLocaleString()}</span>
+                  </span>
+                )}
+              </div>
+              <div className="text-[10px] text-gray-500 mt-1">
+                Reviews shown below. Lexical weighted-Jaccard ≥ 0.80; doesn't catch synonym variants.
+              </div>
+            </div>
+          </div>
+
+          <p className="text-xs text-gray-500 mt-3 leading-relaxed">
+            Both branches read the same <strong className="text-gray-400">{(summary.afterPostAstFamily ?? summary.afterAst)?.toLocaleString() ?? '?'}</strong> post-family canonicals
+            and each runs its own LLM classification. <strong className="text-teal-300">Semantic</strong> (top) is the primary
+            path — it catches terminology variants lexical Jaccard misses.
+            <strong className="text-indigo-300"> Similarity</strong> (this tab) is retained as a
+            high-precision alternative for pairs with heavy metric/table overlap.
+          </p>
+        </div>
+      )}
+
     <div className="bg-[#16213e] p-6 rounded-lg">
       <div className="flex justify-between items-start mb-4">
         <div>
@@ -3514,6 +8166,7 @@ function LlmReviewTab({
           </div>
         )}
       </div>
+    </div>
     </div>
   );
 }

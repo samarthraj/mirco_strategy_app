@@ -43,6 +43,12 @@ lerna-debug.log*
 .env
 .env.local
 .env.*.local
+# Defensive: loose key files that aren't .env-shaped
+*Key.txt
+*key.txt
+*Secret*.txt
+*.key
+*.pem
 
 # ============================================================
 # Databases
@@ -74,6 +80,21 @@ public/inventory/
 public/projects/
 public/rationalization_report.json
 dist/data/
+
+# Playground experiment artifacts (AI experiments, tasks, active-primary pointer)
+data/_playground/
+
+# Session-run retry caches (may contain full SQL bodies, sometimes very large)
+retry_sql_results.json
+retry_sql_candidates.json
+
+# Batch-extracted metadata dumps (tens of MB each)
+extract_*_batch*.json
+extract_IN_batch*.json
+output_batch*/
+
+# Files that tend to carry hardcoded creds — leave to ad-hoc use, NEVER commit
+extract_in_batch*.py
 
 # UserActivity exports
 UserActivity.csv

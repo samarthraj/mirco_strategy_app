@@ -922,7 +922,6 @@ def main():
         "analysis/orphans.json — Orphaned objects list",
         "analysis/unused_metrics.json — Unused metrics list",
         "analysis/high_impact.json — Top 50 high-impact objects",
-        "rationalization_report.json — Full machine-readable report",
     ]
     for d in deliverables:
         doc.add_paragraph(d, style="List Bullet")

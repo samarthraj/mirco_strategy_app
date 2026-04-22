@@ -23,8 +23,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 from mstr_report_inventory import MstrClient
 
 BASE_URL = os.environ.get("MSTR_BASE_URL", "https://rlanalytics-sbx.ralphlauren.com/MicroStrategyLibrary/api")
-USERNAME = os.environ["MSTR_USERNAME"]
-PASSWORD = os.environ["MSTR_PASSWORD"]
+# Resolved lazily — only needed if ancestors have to be fetched (cache miss).
+def _get_creds():
+    return os.environ["MSTR_USERNAME"], os.environ["MSTR_PASSWORD"]
 PROJECT_ID = "E77B77894C04BF0E6D244F9363CFAF64"
 
 PROJECT_DIR = Path("Global Operational")
@@ -63,14 +64,23 @@ def main() -> int:
             if le > info["last_exec"]:
                 info["last_exec"] = le
 
-    # Resume cache (id -> path) so reruns skip fetched dossiers
-    cache_path = PROJECT_DIR / "inventory" / "fetched_dossier_paths.json"
+    # Canonical path file (shared across reports + dossiers for GO).
+    # Shape: [{"id": "...", "path": "..."}].
+    paths_file = PROJECT_DIR / "inventory" / "paths.json"
     cache: dict[str, str] = {}
-    if cache_path.exists():
+    if paths_file.exists():
         try:
-            cache = json.loads(cache_path.read_text(encoding="utf-8"))
+            existing = json.loads(paths_file.read_text(encoding="utf-8"))
+            if isinstance(existing, list):
+                for item in existing:
+                    if isinstance(item, dict) and item.get("id"):
+                        cache[item["id"]] = item.get("path") or ""
         except Exception:
-            cache = {}
+            pass
+
+    def _save_paths_file():
+        payload = [{"id": rid, "path": p} for rid, p in sorted(cache.items()) if p]
+        paths_file.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
     need_fetch = []
     for d in dossiers:
@@ -85,8 +95,9 @@ def main() -> int:
     print(f"  Need to fetch via ancestors:     {len(need_fetch):,}")
 
     if need_fetch:
+        username, password = _get_creds()
         client = MstrClient(
-            base_url=BASE_URL, username=USERNAME, password=PASSWORD, login_mode=1,
+            base_url=BASE_URL, username=username, password=password, login_mode=1,
         )
         client.login()
         client.resolve_project(project_id=PROJECT_ID, project_name=None)
@@ -111,10 +122,10 @@ def main() -> int:
                 cache[oid] = ""
             if i % 50 == 0:
                 rate = i / (time.time() - t0)
-                cache_path.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+                _save_paths_file()
                 print(f"    {i}/{len(need_fetch)}  ({rate:.1f}/s)")
             time.sleep(0.05)
-        cache_path.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+        _save_paths_file()
         try:
             client.logout()
         except Exception:
@@ -184,6 +195,14 @@ def main() -> int:
     s["reductionPct"] = round((s["reductionTotal"] / s["totalInventory"]) * 100, 1) if s["totalInventory"] else 0
     SUMMARY.write_text(json.dumps(s, indent=2, default=str), encoding="utf-8")
     print(f"  Updated summary.json: totalInventory={s['totalInventory']:,}, totalDossiers={s['totalDossiers']:,}")
+
+    # Mirror into the SQLite store so the DB picks up the dossiers too.
+    try:
+        from db.sync import sync_project
+        sync_project("Global Operational")
+    except Exception as e:
+        print(f"  WARNING: DB sync step failed: {e}")
+
     return 0
 
 

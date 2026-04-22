@@ -7,12 +7,10 @@ import DataViewer from './components/DataViewer';
 import ApiExplorer from './components/ApiExplorer';
 import RequestLogPanel from './components/RequestLogPanel';
 import ReportSearch from './components/ReportSearch';
-import ReportInventory from './components/ReportInventory';
 import DataExplorer from './components/DataExplorer';
 import Dashboard from './components/Dashboard';
-import Rationalization from './components/Rationalization';
 import RationalizationAnalysis from './components/RationalizationAnalysis';
-import ObjectTree from './components/ObjectTree';
+import CrossProject from './components/CrossProject';
 
 function MainContent() {
   const { currentView, isAuthenticated } = useApp();
@@ -25,10 +23,8 @@ function MainContent() {
     case 'browser': return <ObjectBrowser />;
     case 'data-explorer': return <DataExplorer />;
     case 'reports': return <ReportSearch />;
-    case 'inventory': return <ReportInventory />;
-    case 'rationalization': return <Rationalization />;
     case 'rationalization-analysis': return <RationalizationAnalysis />;
-    case 'object-tree': return <ObjectTree />;
+    case 'cross-project': return <CrossProject />;
     case 'report':
     case 'cube': return <DataViewer />;
     case 'explorer': return <ApiExplorer />;

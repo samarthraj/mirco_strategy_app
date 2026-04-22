@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------------------
-# Telemetry loader (from rationalize_with_telemetry.py)
+# Telemetry loader
 # ---------------------------------------------------------------------------
 
 def load_telemetry_csv(csv_path: str) -> List[Dict[str, Any]]:
