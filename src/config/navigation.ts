@@ -8,7 +8,7 @@ const navigationConfig: Record<string, boolean> = {
   projects:       true,
   dashboard:      true,
   'object-browser': false,
-  'data-explorer':  true,
+  'data-explorer':  false,
   reports:        false,
   'api-explorer':   false,
   'request-log':    true,

@@ -14,8 +14,13 @@ import {
   fetchPlaygroundTask, askAssistant,
   fetchActiveExperiment, setActiveExperiment, clearActiveExperiment,
   fetchActiveExperimentSemanticClusters,
-  runDomainClassification,
+  runDomainClassification, fetchDomainResults,
+  fetchRetainedReports, toggleReportRetained,
+  fetchRetiredOverrides, toggleReportRetired,
   runDensityClustering, fetchDensityDefaults,
+  runExperimentLlmReview,
+  fetchEmbeddingSets, previewEmbeddingSet, runEmbeddingSet, deleteEmbeddingSet,
+  fetchCombinedStatus, rebuildCombinedReports,
 } from '../api/rationalizationClient';
 import type {
   RationalizationSummary, ClusterMeta, ReportDetail, PairSimilarity, Family,
@@ -24,6 +29,8 @@ import type {
   PlaygroundExperimentIndexEntry, PlaygroundExperiment, PlaygroundTask,
   PlaygroundVizPoint, ActiveExperimentInfo,
   FamilyCollapsedSibling,
+  EmbeddingSet, EmbeddingSetPreview,
+  CombinedStatus,
 } from '../api/rationalizationClient';
 
 // localStorage-backed state — survives tab switches AND page reloads.
@@ -43,7 +50,7 @@ function usePersistentState<T>(key: string, initial: T): [T, (v: T | ((prev: T) 
 import ReportComparison from './ReportComparison';
 import { useApp } from '../context/AppContext';
 
-type TabKey = 'overview' | 'methodology' | 'phases' | 'collisions' | 'fingerprints' | 'sqlhash' | 'ast' | 'families' | 'clusters' | 'semantic' | 'comparison' | 'ai-playground' | 'density' | 'llm-review' | 'reports' | 'heavy-users' | 'summary';
+type TabKey = 'overview' | 'methodology' | 'phases' | 'collisions' | 'fingerprints' | 'sqlhash' | 'ast' | 'families' | 'clusters' | 'semantic' | 'comparison' | 'embeddings' | 'ai-playground' | 'density' | 'classify-domain' | 'llm-review' | 'reports' | 'heavy-users' | 'summary';
 
 interface SlimListRow {
   id: string;
@@ -73,15 +80,22 @@ const TAB_LABELS: Record<TabKey, string> = {
   ast: 'AST',
   families: 'Families',
   clusters: 'Jaccard Clusters',
-  semantic: 'Semantic Clusters',
+  'classify-domain': 'Classify Domain',
   comparison: 'Jaccard vs Semantic',
+  embeddings: 'Embeddings',
   'ai-playground': 'AI Playground',
+  semantic: 'Semantic Clusters',
   density: 'Density Clustering',
   'llm-review': 'LLM Review',
   reports: 'Final Reports to Keep',
   'heavy-users': 'Heavy Users',
   summary: 'Summary',
 };
+
+// Tabs that still render (and can be reached programmatically) but are
+// omitted from the main nav bar. Keeps the UI uncluttered without ripping
+// out the underlying component or summary data.
+const HIDDEN_TABS = new Set<TabKey>(['phases', 'comparison', 'density', 'llm-review']);
 
 export default function RationalizationAnalysis() {
   const { currentProject } = useApp();
@@ -112,6 +126,11 @@ export default function RationalizationAnalysis() {
   const [llmActionFilter, setLlmActionFilter] = useState<'all' | string>('all');
   const [selectedLlmReview, setSelectedLlmReview] = useState<LlmReview | null>(null);
   const [semanticClusters, setSemanticClusters] = useState<SemanticCluster[]>([]);
+  // Raw pipeline-emitted semantic clusters (with real LLM reviews). Kept
+  // separate from `semanticClusters` so that when a Playground experiment
+  // is promoted as Primary, the LLM Review tab still sees the pipeline's
+  // LLM-reviewed clusters instead of the experiment's un-reviewed ones.
+  const [rawPipelineSemanticClusters, setRawPipelineSemanticClusters] = useState<SemanticCluster[]>([]);
   // If a Playground experiment is promoted as "primary" for this project, the
   // Semantic Clusters tab loads its data instead of the static pipeline file.
   const [activeExpInfo, setActiveExpInfo] = useState<ActiveExperimentInfo | null>(null);
@@ -124,7 +143,13 @@ export default function RationalizationAnalysis() {
   const [comparisonSearch, setComparisonSearch] = useState('');
   const [heavyUsers, setHeavyUsers] = useState<HeavyUser[]>([]);
   const [heavyUserSearch, setHeavyUserSearch] = useState('');
-  const [heavyUserShowService, setHeavyUserShowService] = useState(false);
+  const [heavyUserFilter, setHeavyUserFilter] = useState<'all' | 'human' | 'service'>('all');
+  // Project-scoped user overrides — "retain this even if LLM said drop it"
+  // and "retire this even if LLM/primary kept it". Loaded when the project
+  // changes and when the cluster modal closes (so toggles in the modal
+  // propagate back to the Final Reports count).
+  const [projectRetained, setProjectRetained] = useState<Set<string>>(new Set());
+  const [projectRetired, setProjectRetired] = useState<Set<string>>(new Set());
   const [selectedHeavyUser, setSelectedHeavyUser] = useState<HeavyUser | null>(null);
   const [reportListModal, setReportListModal] = useState<
     null | { title: string; kind: 'inventory' | 'retired' | 'active' }
@@ -142,6 +167,9 @@ export default function RationalizationAnalysis() {
   const [clusterSearch, setClusterSearch] = useState('');
   const [familySearch, setFamilySearch] = useState('');
   const [reportSearch, setReportSearch] = useState('');
+  // Min-threshold filters — empty string = no filter, any non-negative integer filters `>`.
+  const [reportMinUsers, setReportMinUsers] = useState<string>('');
+  const [reportMinExecs, setReportMinExecs] = useState<string>('');
   const [reportSort, setReportSort] = useState<'executions' | 'name' | 'users'>('executions');
   const [reportPathFilter, setReportPathFilter] = useState<'all' | 'public' | 'personal'>('all');
   const [reportSourceFilter, setReportSourceFilter] = useState<'all' | 'normal' | 'cube' | 'custom_sql_free_form' | 'none'>('all');
@@ -203,6 +231,10 @@ export default function RationalizationAnalysis() {
         setHeavyUsers(hu);
         setClusterComparison(cmp);
 
+        // Always keep the pipeline's LLM-reviewed semantic clusters around
+        // (they carry the `llm` payloads the LLM Review tab needs).
+        setRawPipelineSemanticClusters(sem);
+
         if (active && active.expId) {
           // Replace pipeline's semantic clusters with the active experiment's
           const expSem = await fetchActiveExperimentSemanticClusters(projectName).catch(() => null);
@@ -235,14 +267,17 @@ export default function RationalizationAnalysis() {
     if (!projectName) return;
     try {
       const active = await fetchActiveExperiment(projectName);
+      // Refresh the raw pipeline clusters every time so LLM Review always
+      // reflects what the pipeline currently has reviewed.
+      const pipeSem = await fetchSemanticClusters(projectName).catch(() => [] as SemanticCluster[]);
+      setRawPipelineSemanticClusters(pipeSem);
       if (active && active.expId) {
         const expSem = await fetchActiveExperimentSemanticClusters(projectName);
         setActiveExpInfo(active);
-        if (expSem) setSemanticClusters(expSem);
+        setSemanticClusters(expSem ?? pipeSem);
       } else {
-        const sem = await fetchSemanticClusters(projectName).catch(() => [] as SemanticCluster[]);
         setActiveExpInfo(null);
-        setSemanticClusters(sem);
+        setSemanticClusters(pipeSem);
       }
     } catch { /* ignore */ }
   }
@@ -359,10 +394,95 @@ export default function RationalizationAnalysis() {
     );
   }, [sqlHashGroups, sqlHashSearch]);
 
-  const finalKeptReports = useMemo(
-    () => reports.filter((r) => r.isFinalCanonical === true),
-    [reports]
-  );
+  // Refresh user overrides whenever the project changes or the cluster
+  // modal closes (closing the modal implies user may have toggled flags).
+  useEffect(() => {
+    const short = PROJECT_NAME_TO_SHORT[projectName];
+    if (!short) return;
+    let cancelled = false;
+    fetchRetainedReports(short).then((s) => { if (!cancelled) setProjectRetained(s); });
+    fetchRetiredOverrides(short).then((s) => { if (!cancelled) setProjectRetired(s); });
+    return () => { cancelled = true; };
+  }, [projectName, selectedCluster]);
+
+  // Shared toggle handlers — used by both the Semantic cluster modal and
+  // the Final Reports tab. Optimistic local update + persisted POST.
+  // Toggling one set clears the other (mutually exclusive server-side).
+  const projectShortForMutation = PROJECT_NAME_TO_SHORT[projectName] || '';
+  const handleToggleRetain = async (rid: string) => {
+    if (!projectShortForMutation) return;
+    const wasRetained = projectRetained.has(rid);
+    setProjectRetained((prev) => {
+      const next = new Set(prev);
+      if (wasRetained) next.delete(rid); else next.add(rid);
+      return next;
+    });
+    if (!wasRetained && projectRetired.has(rid)) {
+      setProjectRetired((prev) => { const n = new Set(prev); n.delete(rid); return n; });
+    }
+    const ok = await toggleReportRetained(projectShortForMutation, rid, !wasRetained);
+    if (!ok) {
+      setProjectRetained((prev) => {
+        const next = new Set(prev);
+        if (wasRetained) next.add(rid); else next.delete(rid);
+        return next;
+      });
+    }
+  };
+  const handleToggleRetire = async (rid: string) => {
+    if (!projectShortForMutation) return;
+    const wasRetired = projectRetired.has(rid);
+    setProjectRetired((prev) => {
+      const next = new Set(prev);
+      if (wasRetired) next.delete(rid); else next.add(rid);
+      return next;
+    });
+    if (!wasRetired && projectRetained.has(rid)) {
+      setProjectRetained((prev) => { const n = new Set(prev); n.delete(rid); return n; });
+    }
+    const ok = await toggleReportRetired(projectShortForMutation, rid, !wasRetired);
+    if (!ok) {
+      setProjectRetired((prev) => {
+        const next = new Set(prev);
+        if (wasRetired) next.add(rid); else next.delete(rid);
+        return next;
+      });
+    }
+  };
+
+  // Derive the "finalKept" ID set from whatever's currently in scope. When
+  // an experiment is promoted as primary, we want the Final Reports tab to
+  // immediately reflect THAT experiment's primaries + singletons — not the
+  // stale `isFinalCanonical` baked into reports.json at emit time. This
+  // avoids needing to re-emit every time the user flips the active.
+  const experimentFinalKeptIds = useMemo<Set<string> | null>(() => {
+    if (!activeExpInfo?.expId || semanticClusters.length === 0) return null;
+    const ids = new Set<string>();
+    for (const c of semanticClusters) {
+      if (c.isSingletons) {
+        // Singleton bucket — every member is a final-kept singleton.
+        for (const m of c.memberIds) ids.add(m);
+      } else {
+        // Multi-cluster — only the primary is kept.
+        if (c.primaryReportId) ids.add(c.primaryReportId);
+      }
+    }
+    return ids;
+  }, [activeExpInfo, semanticClusters]);
+
+  // Effective Final Reports to Keep:
+  //   (experimentFinalKept ?? isFinalCanonical) ∪ user_retained − user_retired
+  // When a primary experiment is promoted, its primaries+singletons become
+  // the truth; retain/retire overrides still apply on top.
+  const finalKeptReports = useMemo(() => {
+    return reports.filter((r) => {
+      if (projectRetired.has(r.id)) return false;
+      const inExperiment = experimentFinalKeptIds
+        ? experimentFinalKeptIds.has(r.id)
+        : r.isFinalCanonical === true;
+      return inExperiment || projectRetained.has(r.id);
+    });
+  }, [reports, experimentFinalKeptIds, projectRetained, projectRetired]);
 
   const filteredReports = useMemo(() => {
     const q = reportSearch.toLowerCase().trim();
@@ -391,14 +511,29 @@ export default function RationalizationAnalysis() {
         return reportPathFilter === 'personal' ? isPersonal : !isPersonal;
       });
     }
+    // Min-threshold filters (strict `>`). Empty string / NaN = no filter.
+    const minU = reportMinUsers === '' ? null : parseInt(reportMinUsers, 10);
+    if (minU != null && !Number.isNaN(minU)) {
+      list = list.filter((r) => (r.users ?? 0) > minU);
+    }
+    const minE = reportMinExecs === '' ? null : parseInt(reportMinExecs, 10);
+    if (minE != null && !Number.isNaN(minE)) {
+      list = list.filter((r) => (r.executions ?? 0) > minE);
+    }
     list = [...list].sort((a, b) => {
       if (reportSort === 'name') return a.name.localeCompare(b.name);
       if (reportSort === 'users') return b.users - a.users;
       return b.executions - a.executions;
     });
-    return list.slice(0, 2000);
+    // Scope-aware render cap. Final-kept sets are usually <10k (was a hard
+    // 2000 previously, which silently truncated GI's 2,610 — noticed by the
+    // "shows 2000 but count says 2,610" bug report). All-inventory can be
+    // 100k+, so keep a tighter cap there and let filters narrow it down.
+    const MAX_ROWS = reportScope === 'final' ? 20000 : 5000;
+    return list.slice(0, MAX_ROWS);
   }, [finalKeptReports, reports, reportScope, reportSourceFilter,
-      reportSearch, reportSort, reportPathFilter]);
+      reportSearch, reportSort, reportPathFilter,
+      reportMinUsers, reportMinExecs]);
 
   function handleOpenCluster(cluster: ClusterMeta) {
     setSelectedCluster(cluster);
@@ -549,19 +684,21 @@ export default function RationalizationAnalysis() {
       {/* Tab Nav */}
       <div className="bg-[#16213e] border-b border-[#1e2d50] px-6">
         <div className="flex gap-1">
-          {(Object.keys(TAB_LABELS) as TabKey[]).map((key) => (
-            <button
-              key={key}
-              onClick={() => setActiveTab(key)}
-              className={`px-4 py-3 text-sm font-medium transition-colors ${
-                activeTab === key
-                  ? 'text-white border-b-2 border-red-500'
-                  : 'text-gray-400 hover:text-white'
-              }`}
-            >
-              {TAB_LABELS[key]}
-            </button>
-          ))}
+          {(Object.keys(TAB_LABELS) as TabKey[])
+            .filter((key) => !HIDDEN_TABS.has(key))
+            .map((key) => (
+              <button
+                key={key}
+                onClick={() => setActiveTab(key)}
+                className={`px-4 py-3 text-sm font-medium transition-colors ${
+                  activeTab === key
+                    ? 'text-white border-b-2 border-red-500'
+                    : 'text-gray-400 hover:text-white'
+                }`}
+              >
+                {TAB_LABELS[key]}
+              </button>
+            ))}
         </div>
       </div>
 
@@ -652,6 +789,9 @@ export default function RationalizationAnalysis() {
               await reloadSemanticFromActive();
             }}
             onGoToPlayground={() => setActiveTab('ai-playground')}
+            finalKeptCount={finalKeptReports.length}
+            retainedCount={projectRetained.size}
+            retiredCount={projectRetired.size}
           />
         )}
         {activeTab === 'llm-review' && (
@@ -663,7 +803,21 @@ export default function RationalizationAnalysis() {
             actionFilter={llmActionFilter}
             setActionFilter={setLlmActionFilter}
             summary={effectiveSummary!}
-            semanticClusters={semanticClusters}
+            semanticClusters={(() => {
+              // If the active overlay (promoted experiment) has LLM reviews,
+              // prefer THOSE — they reflect the clusters the user actually
+              // promoted. Otherwise fall back to the pipeline's reviewed
+              // semantic clusters. This keeps the LLM Review tab consistent
+              // with whatever the user is currently looking at in Semantic.
+              const overlaidReviewed = semanticClusters.filter(
+                (c) => !c.isSingletons && c.llm && !c.llm.error && c.llm.label,
+              ).length;
+              if (overlaidReviewed > 0) return semanticClusters;
+              return rawPipelineSemanticClusters.length > 0
+                ? rawPipelineSemanticClusters
+                : semanticClusters;
+            })()}
+            reportById={reportById}
             onOpen={setSelectedLlmReview}
           />
         )}
@@ -688,6 +842,14 @@ export default function RationalizationAnalysis() {
             onOpenReport={setSelectedReport}
             projectId={currentProject?.id || ''}
             projectName={projectName}
+            retained={projectRetained}
+            retiredOverrides={projectRetired}
+            onToggleRetain={handleToggleRetain}
+            onToggleRetire={handleToggleRetire}
+            minUsers={reportMinUsers}
+            setMinUsers={setReportMinUsers}
+            minExecs={reportMinExecs}
+            setMinExecs={setReportMinExecs}
           />
         )}
         {activeTab === 'comparison' && (
@@ -697,6 +859,12 @@ export default function RationalizationAnalysis() {
             setCategory={setComparisonCategory}
             search={comparisonSearch}
             setSearch={setComparisonSearch}
+          />
+        )}
+        {activeTab === 'embeddings' && (
+          <EmbeddingsTab
+            projectId={currentProject?.id || ''}
+            projectName={projectName}
           />
         )}
         {activeTab === 'ai-playground' && (
@@ -715,13 +883,18 @@ export default function RationalizationAnalysis() {
             onActiveChanged={reloadSemanticFromActive}
           />
         )}
+        {activeTab === 'classify-domain' && (
+          <ClassifyDomainTab
+            projectId={currentProject?.id || ''}
+          />
+        )}
         {activeTab === 'heavy-users' && (
           <HeavyUsersTab
             users={heavyUsers}
             search={heavyUserSearch}
             setSearch={setHeavyUserSearch}
-            showService={heavyUserShowService}
-            setShowService={setHeavyUserShowService}
+            filter={heavyUserFilter}
+            setFilter={setHeavyUserFilter}
             onOpen={setSelectedHeavyUser}
           />
         )}
@@ -743,8 +916,13 @@ export default function RationalizationAnalysis() {
         <SemanticClusterModal
           cluster={selectedSemantic}
           reportById={reportById}
+          projectId={currentProject?.id || ''}
           onClose={() => setSelectedSemantic(null)}
           onCompare={handleCompareReports}
+          retained={projectRetained}
+          retiredOverrides={projectRetired}
+          onToggleRetain={handleToggleRetain}
+          onToggleRetire={handleToggleRetire}
         />
       )}
 
@@ -895,6 +1073,171 @@ function jaccardArr(a: string[], b: string[]): number {
 // OVERVIEW TAB
 // ─────────────────────────────────────────────────────────────────────
 
+// Renders on the Combined Reports Project's Overview tab only. Pulls
+// /playground_api/combined/status on mount to tell the user when each
+// source project was last snapshotted + whether anything has drifted.
+// "Rebuild" kicks off an async task that re-copies + re-runs the pipeline.
+function CombinedRebuildBanner() {
+  const [status, setStatus] = useState<CombinedStatus | null>(null);
+  const [task, setTask] = useState<PlaygroundTask | null>(null);
+  const [runStartedAt, setRunStartedAt] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const pollRef = useRef<number | null>(null);
+
+  const load = async () => {
+    setStatus(await fetchCombinedStatus());
+  };
+  useEffect(() => { load(); /* eslint-disable-next-line */ }, []);
+
+  // Poll the active task
+  useEffect(() => {
+    if (!task || task.status !== 'running') {
+      if (pollRef.current) { window.clearInterval(pollRef.current); pollRef.current = null; }
+      return;
+    }
+    const tick = async () => {
+      const t = await fetchPlaygroundTask(task.id);
+      if (!t) return;
+      setTask(t);
+      if (t.status === 'completed') {
+        setRunStartedAt(null);
+        setTask(null);
+        await load();
+        // Nudge the page — the summary/cluster data just changed, so the
+        // simplest correct thing is a full reload of the tab.
+        window.location.reload();
+      } else if (t.status === 'failed' || t.status === 'interrupted') {
+        setError(t.error || `Task ${t.status}`);
+        setRunStartedAt(null);
+        setTask(null);
+      }
+    };
+    pollRef.current = window.setInterval(tick, 2000);
+    tick();
+    return () => {
+      if (pollRef.current) { window.clearInterval(pollRef.current); pollRef.current = null; }
+    };
+  }, [task?.id, task?.status]);
+
+  // Force re-render every second so elapsed timer updates during a run
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!runStartedAt) return;
+    const id = window.setInterval(() => setTick((x) => x + 1), 1000);
+    return () => window.clearInterval(id);
+  }, [runStartedAt]);
+
+  async function handleRebuild() {
+    setError(null);
+    setRunStartedAt(Date.now());
+    try {
+      const t = await rebuildCombinedReports();
+      setTask(t);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setRunStartedAt(null);
+    }
+  }
+
+  const running = task?.status === 'running';
+  const elapsed = runStartedAt ? Math.floor((Date.now() - runStartedAt) / 1000) : 0;
+
+  if (!status) {
+    return (
+      <div className="bg-[#16213e] border border-violet-800/40 p-3 rounded text-xs text-gray-400">
+        Loading combined status…
+      </div>
+    );
+  }
+
+  return (
+    <div className={`p-4 rounded-lg border ${
+      status.stale
+        ? 'bg-gradient-to-r from-amber-950/40 to-[#16213e] border-amber-700/60'
+        : 'bg-gradient-to-r from-violet-950/40 to-[#16213e] border-violet-700/40'
+    }`}>
+      <div className="flex items-start justify-between gap-4">
+        <div className="flex-1 min-w-0">
+          <div className={`text-xs uppercase tracking-wider font-bold mb-2 ${
+            status.stale ? 'text-amber-300' : 'text-violet-300'
+          }`}>
+            Combined Reports Project
+            {status.stale && (
+              <span className="ml-2 font-normal normal-case text-amber-400">
+                ⚠ {status.lastBuiltAt ? 'source projects changed since last rebuild' : 'not built yet'}
+              </span>
+            )}
+          </div>
+          <div className="text-sm text-gray-300 leading-relaxed">
+            {status.totalReports > 0 ? (
+              <>
+                <strong className="text-white">{status.totalReports.toLocaleString()}</strong> reports combined
+                {status.lastBuiltAt && (
+                  <>
+                    {' '}· last rebuilt <strong>{new Date(status.lastBuiltAt).toLocaleString()}</strong>
+                  </>
+                )}
+              </>
+            ) : (
+              <span className="italic text-gray-400">Never built. Click Rebuild to snapshot final-kept reports from GO, GI, and INSIGHT.</span>
+            )}
+          </div>
+          <div className="mt-2 grid grid-cols-1 md:grid-cols-3 gap-2 text-xs">
+            {status.sources.map((s) => (
+              <div key={s.sourceProjectId} className={`p-2 rounded border ${
+                s.stale ? 'border-amber-700/50 bg-amber-950/20' : 'border-[#1e2d50] bg-[#0f0f1a]'
+              }`}>
+                <div className="flex items-center gap-2">
+                  <span className="font-semibold text-white">{s.sourceName}</span>
+                  {s.stale && (
+                    <span className="text-[9px] font-bold text-amber-300 bg-amber-950/60 border border-amber-700/60 rounded px-1 py-0.5">
+                      DRIFT
+                    </span>
+                  )}
+                </div>
+                <div className="text-gray-400 mt-0.5">
+                  {s.builtAt ? (
+                    <>
+                      <span>{s.reportCount.toLocaleString()} copied</span>
+                      {s.currentCount !== s.reportCount && (
+                        <span className="text-amber-400"> · now {s.currentCount.toLocaleString()}</span>
+                      )}
+                    </>
+                  ) : (
+                    <span className="italic">{s.currentCount.toLocaleString()} final-kept · not copied yet</span>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+          {error && (
+            <div className="mt-2 text-xs text-red-300 bg-red-950/40 border border-red-700/50 rounded p-2">
+              Rebuild failed: {error}
+            </div>
+          )}
+          {running && (
+            <div className="mt-2 text-xs text-violet-200">
+              Rebuilding… ({elapsed}s) — copying reports, running the pipeline, emitting JSON. Usually 2–5 minutes.
+            </div>
+          )}
+        </div>
+        <div className="flex flex-col gap-2 flex-shrink-0">
+          <button onClick={handleRebuild} disabled={running}
+            className={`text-sm font-semibold px-4 py-2 rounded ${
+              running
+                ? 'bg-violet-900 text-gray-500 cursor-not-allowed'
+                : status.stale
+                ? 'bg-amber-600 hover:bg-amber-500 text-white'
+                : 'bg-violet-600 hover:bg-violet-500 text-white'
+            }`}>
+            {running ? `Rebuilding… (${elapsed}s)` : status.lastBuiltAt ? '↻ Rebuild now' : '▶ Build now'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function OverviewTab({
   summary,
   onKpiClick,
@@ -902,6 +1245,7 @@ function OverviewTab({
   summary: RationalizationSummary;
   onKpiClick: (kind: 'inventory' | 'retired' | 'active') => void;
 }) {
+  const isCombined = summary.projectName === 'Combined Reports Project';
   const kpis: {
     label: string;
     value: number | string;
@@ -919,6 +1263,7 @@ function OverviewTab({
 
   return (
     <div className="space-y-6">
+      {isCombined && <CombinedRebuildBanner />}
       {/* KPI Grid */}
       <div className="grid grid-cols-6 gap-4">
         {kpis.map((kpi) => {
@@ -2454,6 +2799,9 @@ function SemanticTab({
   activeExpInfo,
   onClearActive,
   onGoToPlayground,
+  finalKeptCount,
+  retainedCount,
+  retiredCount,
 }: {
   clusters: SemanticCluster[];
   search: string;
@@ -2466,6 +2814,9 @@ function SemanticTab({
   activeExpInfo?: ActiveExperimentInfo | null;
   onClearActive?: () => void | Promise<void>;
   onGoToPlayground?: () => void;
+  finalKeptCount: number;
+  retainedCount: number;
+  retiredCount: number;
 }) {
   const sqlCountByCluster = useMemo(() => {
     const m = new Map<string, number>();
@@ -2559,6 +2910,42 @@ function SemanticTab({
           )}
         </div>
       )}
+      {/* Final-kept running total — reflects user overrides from the
+          Disposition pill in each cluster modal. Matches the count in the
+          "Final Reports to Keep" tab. */}
+      <div className="bg-gradient-to-r from-emerald-950/40 to-[#16213e] p-4 rounded-lg border border-emerald-700/40">
+        <div className="flex items-center justify-between flex-wrap gap-3">
+          <div>
+            <div className="text-xs uppercase tracking-wider text-emerald-300 font-bold mb-1">
+              Final Reports to Keep — after overrides
+            </div>
+            <div className="text-xs text-gray-400">
+              Matches the count in the Final Reports to Keep tab. Updates live
+              as you toggle Retain / Retire on each cluster member.
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="px-4 py-2 bg-emerald-900/30 rounded-lg border border-emerald-600/60">
+              <div className="text-[10px] uppercase tracking-wider text-emerald-300">Final Kept</div>
+              <div className="text-2xl font-bold text-white text-right">
+                {finalKeptCount.toLocaleString()}
+              </div>
+            </div>
+            <div className="px-3 py-2 bg-[#0f0f1a] rounded-lg border border-[#1e2d50] min-w-[90px]">
+              <div className="text-[10px] uppercase tracking-wider text-gray-400">Retained overrides</div>
+              <div className="text-lg font-bold text-emerald-300 text-right">
+                +{retainedCount.toLocaleString()}
+              </div>
+            </div>
+            <div className="px-3 py-2 bg-[#0f0f1a] rounded-lg border border-[#1e2d50] min-w-[90px]">
+              <div className="text-[10px] uppercase tracking-wider text-gray-400">Retired overrides</div>
+              <div className="text-lg font-bold text-red-300 text-right">
+                {'−'}{retiredCount.toLocaleString()}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
       {/* Pipeline lineage banner — Semantic is a parallel branch off post-AST */}
       {summary && (
         <div className="bg-gradient-to-r from-teal-950/60 to-[#16213e] p-4 rounded-lg border border-teal-800/40">
@@ -2958,15 +3345,65 @@ function SemanticTab({
 function SemanticClusterModal({
   cluster,
   reportById,
+  projectId,
   onClose,
   onCompare,
+  retained,
+  retiredOverrides,
+  onToggleRetain,
+  onToggleRetire,
 }: {
   cluster: SemanticCluster;
   reportById: Map<string, ReportDetail>;
+  projectId: string;
   onClose: () => void;
   onCompare: (a: ReportDetail, b: ReportDetail) => void;
+  // Shared state + shared toggle handlers owned by the parent. Using the
+  // parent's handlers means the Final Reports count updates the moment a
+  // user flips disposition here, without any re-fetch dance.
+  retained: Set<string>;
+  retiredOverrides: Set<string>;
+  onToggleRetain: (rid: string) => void | Promise<void>;
+  onToggleRetire: (rid: string) => void | Promise<void>;
 }) {
+  // projectId isn't used directly now (toggles go through parent handlers),
+  // kept in the signature so existing call sites don't break.
+  void projectId;
   const [selectedForCompare, setSelectedForCompare] = useState<string[]>([]);
+
+  // Derived: which members GPT marked removable. Falls back to action-based
+  // defaults when the LLM didn't supply per-report IDs (older experiments or
+  // big clusters where the prompt only saw the first 25 members).
+  const removableSet = useMemo(() => {
+    const llm = cluster.llm;
+    if (!llm || llm.error) return null;
+    const explicit = llm.removableIds || [];
+    if (explicit.length > 0) return new Set(explicit);
+    // No explicit IDs — infer from action. Primary is never removable.
+    const action = (llm.action || '').toUpperCase();
+    const inferAll = action === 'MERGE_IMMEDIATE' || action === 'PARAMETERIZE';
+    if (!inferAll) return new Set<string>();
+    const out = new Set<string>();
+    for (const m of cluster.memberIds || []) {
+      if (m !== cluster.primaryReportId) out.add(m);
+    }
+    return out;
+  }, [cluster]);
+
+  // Thin wrappers — delegate to the parent's shared handlers.
+  const handleToggleRetain = (rid: string) => onToggleRetain(rid);
+  const handleToggleRetire = (rid: string) => onToggleRetire(rid);
+
+  // Compute the effective disposition for a given report.
+  // Precedence: primary ⇒ retain (locked); user-retained ⇒ retain;
+  // user-retired ⇒ retire; else LLM verdict (removable ⇒ retire).
+  function effectiveDisposition(rid: string, isPrimary: boolean): 'retain' | 'retire' {
+    if (isPrimary) return 'retain';
+    if (retained.has(rid)) return 'retain';
+    if (retiredOverrides.has(rid)) return 'retire';
+    const llmRemovable = removableSet?.has(rid) ?? false;
+    return llmRemovable ? 'retire' : 'retain';
+  }
   const members = useMemo(() => {
     const enriched = cluster.members
       .map((m) => ({ ...m, report: reportById.get(m.id) }))
@@ -3134,6 +3571,9 @@ function SemanticClusterModal({
                 <th className="text-center p-2 text-xs text-gray-400 uppercase w-16">SQL</th>
                 <th className="text-right p-2 text-xs text-gray-400 uppercase">Execs</th>
                 <th className="text-right p-2 text-xs text-gray-400 uppercase">Users</th>
+                <th className="text-center p-2 text-xs text-gray-400 uppercase w-28" title="Click to toggle. Retain = included in Final Reports to Keep. Retire = marked as removable (consolidated into the primary). Primary is always retained.">
+                  Disposition
+                </th>
               </tr>
             </thead>
             <tbody>
@@ -3174,7 +3614,12 @@ function SemanticClusterModal({
                       </div>
                     </td>
                     <td className={`p-2 ${isPrimary ? 'text-amber-100 font-semibold' : 'text-white'}`}>{r.name}</td>
-                    <td className="p-2"><SourceTypePill sourceType={r.sourceType} /></td>
+                    <td className="p-2">
+                      <div className="flex items-center gap-1 flex-wrap">
+                        <SourceProjectPill sourceProjectId={r.sourceProjectId} />
+                        <SourceTypePill sourceType={r.sourceType} />
+                      </div>
+                    </td>
                     <td className="p-2 text-right font-mono text-teal-300">
                       {isPrimary ? '—' : (m.cosineToPrimary != null ? m.cosineToPrimary.toFixed(3) : '—')}
                     </td>
@@ -3193,6 +3638,46 @@ function SemanticClusterModal({
                       {r.executions.toLocaleString()}
                     </td>
                     <td className="p-2 text-right font-mono text-gray-300">{r.users}</td>
+                    <td className="p-2 text-center" onClick={(e) => e.stopPropagation()}>
+                      {(() => {
+                        const disp = effectiveDisposition(r.id, isPrimary);
+                        const kept = disp === 'retain';
+                        const userRetained = retained.has(r.id);
+                        const userRetired = retiredOverrides.has(r.id);
+                        const handleClick = () => {
+                          if (isPrimary) return;
+                          // Flip the effective disposition. If currently
+                          // retained → mark retire; if retired → mark retain.
+                          if (kept) handleToggleRetire(r.id);
+                          else handleToggleRetain(r.id);
+                        };
+                        const badge = userRetained ? ' (user)' : userRetired ? ' (user)' : '';
+                        return (
+                          <button
+                            type="button"
+                            onClick={handleClick}
+                            disabled={isPrimary}
+                            className={`text-xs px-2 py-0.5 rounded border font-semibold transition-colors w-28 ${
+                              kept
+                                ? 'bg-emerald-900/50 border-emerald-600 text-emerald-200 hover:bg-emerald-800/60'
+                                : 'bg-red-950/40 border-red-700/50 text-red-300 hover:bg-red-900/50'
+                            } ${isPrimary ? 'cursor-default opacity-80' : ''}`}
+                            title={
+                              isPrimary ? 'Primary — always retained'
+                                : kept
+                                  ? (userRetained
+                                      ? 'You explicitly retained this. Click to flip to Retire.'
+                                      : 'LLM says keep. Click to flip to Retire.')
+                                  : (userRetired
+                                      ? 'You explicitly retired this. Click to flip to Retain.'
+                                      : 'LLM says remove. Click to flip to Retain.')
+                            }
+                          >
+                            {kept ? '✓ Retain' : '✗ Retire'}{badge}
+                          </button>
+                        );
+                      })()}
+                    </td>
                   </tr>
                 );
               })}
@@ -3228,6 +3713,14 @@ function ReportsTab({
   onOpenReport,
   projectId,
   projectName,
+  retained,
+  retiredOverrides,
+  onToggleRetain,
+  onToggleRetire,
+  minUsers,
+  setMinUsers,
+  minExecs,
+  setMinExecs,
 }: {
   reports: ReportDetail[];
   totalCount: number;
@@ -3248,8 +3741,42 @@ function ReportsTab({
   onOpenReport: (r: ReportDetail) => void;
   projectId: string;
   projectName: string;
+  retained: Set<string>;
+  retiredOverrides: Set<string>;
+  onToggleRetain: (rid: string) => void | Promise<void>;
+  onToggleRetire: (rid: string) => void | Promise<void>;
+  minUsers: string;
+  setMinUsers: (v: string) => void;
+  minExecs: string;
+  setMinExecs: (v: string) => void;
 }) {
   const [chatOpen, setChatOpen] = useState(false);
+  // Domain classification map — rid -> domain name. Fetched from the
+  // Classify Domain run for this project; empty when nothing's been
+  // classified, in which case grouping falls back to a single "All" bucket.
+  const [domainByReportId, setDomainByReportId] = useState<Map<string, string>>(new Map());
+  const [groupByDomain, setGroupByDomain] = useState<boolean>(true);
+  const [expandedDomains, setExpandedDomains] = useState<Record<string, boolean>>({});
+  useEffect(() => {
+    if (!projectId) return;
+    let cancelled = false;
+    fetchDomainResults(projectId).then((r) => {
+      if (cancelled) return;
+      const m = new Map<string, string>();
+      for (const [domain, reps] of Object.entries(r.byDomain || {})) {
+        for (const rep of reps) m.set(rep.id, domain);
+      }
+      setDomainByReportId(m);
+      // Default: expand every non-empty domain the first time we load.
+      setExpandedDomains((prev) => {
+        if (Object.keys(prev).length > 0) return prev;
+        const init: Record<string, boolean> = {};
+        for (const d of Object.keys(r.byDomain || {})) init[d] = true;
+        return init;
+      });
+    }).catch(() => { /* classification not run yet — empty map is fine */ });
+    return () => { cancelled = true; };
+  }, [projectId]);
   const clusterById = useMemo(() => {
     const map = new Map<string, ClusterMeta>();
     clusters.forEach((c) => map.set(c.id, c));
@@ -3269,13 +3796,31 @@ function ReportsTab({
   };
 
   const title = scope === 'final' ? 'Final Reports to Keep' : 'All Reports (full inventory)';
+  // Any active filter (search, source-type, path, min-users, min-execs) — when
+  // on, we want the count to reflect the narrowed list.
+  const filtersActive =
+    search.trim() !== ''
+    || sourceFilter !== 'all'
+    || pathFilter !== 'all'
+    || minUsers !== ''
+    || minExecs !== '';
   return (
     <div className="bg-[#16213e] p-6 rounded-lg relative">
       <div className="flex items-start justify-between">
         <h2 className="text-lg font-bold text-white mb-1">
           {title}{' '}
           <span className="text-sm text-gray-400 font-normal">
-            ({reports.length.toLocaleString()} of {totalCount.toLocaleString()} shown)
+            (<span className="font-bold text-emerald-400">{reports.length.toLocaleString()}</span>
+            {filtersActive ? (
+              <>
+                {' filtered · '}
+                <span className="text-gray-500">
+                  {totalCount.toLocaleString()} total in scope
+                </span>
+              </>
+            ) : (
+              ' total'
+            )})
           </span>
         </h2>
         <button
@@ -3297,7 +3842,7 @@ function ReportsTab({
       </p>
 
       {/* Scope toggle — final-kept vs full inventory */}
-      <div className="flex gap-2 mb-3">
+      <div className="flex gap-2 mb-3 flex-wrap items-center">
         <button
           onClick={() => setScope('final')}
           className={`text-xs px-3 py-1.5 rounded border ${
@@ -3318,6 +3863,26 @@ function ReportsTab({
         >
           All reports ({allReports.length.toLocaleString()})
         </button>
+        {scope === 'final' && (
+          <label
+            className={`flex items-center gap-1.5 text-xs ml-2 cursor-pointer ${
+              domainByReportId.size === 0 ? 'opacity-50 cursor-not-allowed' : 'text-gray-300 hover:text-white'
+            }`}
+            title={
+              domainByReportId.size === 0
+                ? 'Run Classify Domain on this project first to enable domain grouping.'
+                : 'Group the list below by business domain.'
+            }
+          >
+            <input
+              type="checkbox"
+              checked={groupByDomain}
+              disabled={domainByReportId.size === 0}
+              onChange={(e) => setGroupByDomain(e.target.checked)}
+            />
+            Group by domain
+          </label>
+        )}
       </div>
 
       <div className="flex gap-3 mb-4 flex-wrap">
@@ -3361,6 +3926,48 @@ function ReportsTab({
           <option value="public">Public Only</option>
           <option value="personal">Personal Only</option>
         </select>
+        <label className="flex items-center gap-1.5 bg-[#0f0f1a] border border-[#1e2d50] rounded-lg px-3 py-2.5 text-sm text-gray-300">
+          <span className="text-xs text-gray-400 whitespace-nowrap">Users greater than:</span>
+          <input
+            type="number"
+            min={0}
+            value={minUsers}
+            onChange={(e) => setMinUsers(e.target.value)}
+            placeholder="—"
+            className="bg-transparent w-16 text-white text-sm focus:outline-none"
+          />
+          {minUsers !== '' && (
+            <button
+              type="button"
+              onClick={() => setMinUsers('')}
+              className="text-gray-500 hover:text-red-300 text-xs"
+              title="Clear"
+            >
+              ✕
+            </button>
+          )}
+        </label>
+        <label className="flex items-center gap-1.5 bg-[#0f0f1a] border border-[#1e2d50] rounded-lg px-3 py-2.5 text-sm text-gray-300">
+          <span className="text-xs text-gray-400 whitespace-nowrap">Executions greater than:</span>
+          <input
+            type="number"
+            min={0}
+            value={minExecs}
+            onChange={(e) => setMinExecs(e.target.value)}
+            placeholder="—"
+            className="bg-transparent w-20 text-white text-sm focus:outline-none"
+          />
+          {minExecs !== '' && (
+            <button
+              type="button"
+              onClick={() => setMinExecs('')}
+              className="text-gray-500 hover:text-red-300 text-xs"
+              title="Clear"
+            >
+              ✕
+            </button>
+          )}
+        </label>
       </div>
 
       <div className="max-h-[70vh] overflow-y-auto border border-[#1e2d50] rounded-lg">
@@ -3376,11 +3983,15 @@ function ReportsTab({
               <th className="text-right p-3 text-xs text-gray-400 uppercase">Execs</th>
               <th className="text-right p-3 text-xs text-gray-400 uppercase">Users</th>
               <th className="text-right p-3 text-xs text-gray-400 uppercase" title="Attributes / Metrics / Tables / Filters">A / M / T / F</th>
+              <th className="text-center p-3 text-xs text-gray-400 uppercase w-28" title="Click to flip between Retain and Retire. Primary = locked Retain. Retiring a report in Final-kept scope makes it drop out of this list.">
+                Disposition
+              </th>
               <th className="text-left p-3 text-xs text-gray-400 uppercase">Role</th>
             </tr>
           </thead>
-          <tbody>
-            {reports.map((r) => {
+          {(() => {
+            // Render one row — shared between flat + grouped modes.
+            const renderRow = (r: ReportDetail) => {
               const cluster = r.clusterId ? clusterById.get(r.clusterId) : null;
               const isPrimary = cluster?.primaryReportId === r.id;
               const status = r.status || 'active';
@@ -3397,7 +4008,12 @@ function ReportsTab({
                   className="border-t border-[#1e2d50] hover:bg-[#1a2a4a] text-gray-300 cursor-pointer"
                 >
                   <td className="p-3 text-white">{r.name}</td>
-                  <td className="p-3"><SourceTypePill sourceType={r.sourceType} /></td>
+                  <td className="p-3">
+                    <div className="flex items-center gap-1 flex-wrap">
+                      <SourceProjectPill sourceProjectId={r.sourceProjectId} />
+                      <SourceTypePill sourceType={r.sourceType} />
+                    </div>
+                  </td>
                   {scope === 'all' && (
                     <td className="p-3">
                       <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${statusPill}`}>
@@ -3410,6 +4026,48 @@ function ReportsTab({
                   <td className="p-3 text-right font-mono">{r.users}</td>
                   <td className="p-3 text-right font-mono text-xs">
                     {r.attributeCount ?? 0}/{r.metricCount}/{r.tableCount}/{r.filterCount}
+                  </td>
+                  <td className="p-3 text-center" onClick={(e) => e.stopPropagation()}>
+                    {(() => {
+                      // Primary of a multi-member cluster is never retirable.
+                      const isPrimaryOfMulti = !!(cluster && isPrimary && cluster.size > 1);
+                      const userRetained = retained.has(r.id);
+                      const userRetired = retiredOverrides.has(r.id);
+                      // Effective disposition: primary + user_retained + isFinalCanonical win; user_retired retires.
+                      const kept = isPrimaryOfMulti
+                        || userRetained
+                        || (r.isFinalCanonical === true && !userRetired);
+                      const badge = userRetained ? ' (user)' : userRetired ? ' (user)' : '';
+                      const handleClick = () => {
+                        if (isPrimaryOfMulti) return;
+                        if (kept) onToggleRetire(r.id);
+                        else onToggleRetain(r.id);
+                      };
+                      return (
+                        <button
+                          type="button"
+                          onClick={handleClick}
+                          disabled={isPrimaryOfMulti}
+                          className={`text-xs px-2 py-0.5 rounded border font-semibold transition-colors w-28 ${
+                            kept
+                              ? 'bg-emerald-900/50 border-emerald-600 text-emerald-200 hover:bg-emerald-800/60'
+                              : 'bg-red-950/40 border-red-700/50 text-red-300 hover:bg-red-900/50'
+                          } ${isPrimaryOfMulti ? 'cursor-default opacity-80' : ''}`}
+                          title={
+                            isPrimaryOfMulti ? 'Primary of a multi-member cluster — always retained'
+                              : kept
+                                ? (userRetained
+                                    ? 'You explicitly retained this. Click to flip to Retire.'
+                                    : 'Currently retained by the pipeline. Click to flip to Retire.')
+                                : (userRetired
+                                    ? 'You explicitly retired this. Click to flip to Retain.'
+                                    : 'Click to flip to Retain.')
+                          }
+                        >
+                          {kept ? '✓ Retain' : '✗ Retire'}{badge}
+                        </button>
+                      );
+                    })()}
                   </td>
                   <td className="p-3">
                     {cluster && isPrimary ? (
@@ -3440,8 +4098,59 @@ function ReportsTab({
                   </td>
                 </tr>
               );
-            })}
-          </tbody>
+            };
+
+            // Flat mode — used when scope=all or grouping disabled.
+            if (!(scope === 'final' && groupByDomain && domainByReportId.size > 0)) {
+              return <tbody>{reports.map(renderRow)}</tbody>;
+            }
+
+            // Grouped mode — one tbody per business domain, following
+            // CLASSIFY_DOMAIN_TAXONOMY order; anything not in the taxonomy
+            // lands in "Unclassified" at the end.
+            const taxonomy = CLASSIFY_DOMAIN_TAXONOMY;
+            const buckets: Map<string, ReportDetail[]> = new Map(taxonomy.map((d) => [d, [] as ReportDetail[]]));
+            for (const r of reports) {
+              const d = domainByReportId.get(r.id) || 'Unclassified';
+              if (!buckets.has(d)) buckets.set(d, []);
+              buckets.get(d)!.push(r);
+            }
+            const colspan = scope === 'all' ? 9 : 8;
+            const blocks: React.ReactNode[] = [];
+            for (const [domain, list] of buckets.entries()) {
+              if (list.length === 0) continue;
+              const c = DOMAIN_COLORS[domain] || DOMAIN_COLORS['Unclassified'];
+              const expanded = expandedDomains[domain] ?? true;
+              blocks.push(
+                <tbody key={`hd-${domain}`}>
+                  <tr
+                    onClick={() =>
+                      setExpandedDomains((p) => ({ ...p, [domain]: !expanded }))
+                    }
+                    className={`cursor-pointer border-t border-[#1e2d50] ${c.bg} hover:bg-opacity-70`}
+                  >
+                    <td colSpan={colspan} className="p-2">
+                      <div className="flex items-center gap-2">
+                        <VscChevronRight
+                          className={`text-gray-400 transition-transform ${expanded ? 'rotate-90' : ''}`}
+                        />
+                        <span className={`text-xs font-bold uppercase tracking-wider ${c.text}`}>
+                          {domain}
+                        </span>
+                        <span className="text-xs text-gray-400">
+                          · {list.length.toLocaleString()} {list.length === 1 ? 'report' : 'reports'}
+                          {' · '}
+                          {list.reduce((s, r) => s + (r.executions || 0), 0).toLocaleString()} execs
+                        </span>
+                      </div>
+                    </td>
+                  </tr>
+                  {expanded && list.map(renderRow)}
+                </tbody>,
+              );
+            }
+            return <>{blocks}</>;
+          })()}
         </table>
       </div>
 
@@ -3874,6 +4583,38 @@ function DataQualityBadge({ cluster }: {
   return null;
 }
 
+// Origin pill for reports living in the Combined Reports Project.
+// Shows [GO] / [GI] / [IN] color-coded. Renders nothing for non-combined
+// rows (where sourceProjectId is null).
+function SourceProjectPill({ sourceProjectId }: { sourceProjectId: string | null | undefined }) {
+  if (!sourceProjectId) return null;
+  const meta: Record<string, { short: string; cls: string; name: string }> = {
+    'global-operational': {
+      short: 'GO',
+      cls: 'bg-blue-900/50 text-blue-200 border-blue-700/60',
+      name: 'Global Operational',
+    },
+    'global-insight': {
+      short: 'GI',
+      cls: 'bg-purple-900/50 text-purple-200 border-purple-700/60',
+      name: 'Global Insight',
+    },
+    'insight': {
+      short: 'IN',
+      cls: 'bg-emerald-900/50 text-emerald-200 border-emerald-700/60',
+      name: 'INSIGHT',
+    },
+  };
+  const m = meta[sourceProjectId];
+  if (!m) return null;
+  return (
+    <span className={`text-[9px] font-bold border rounded px-1 py-0.5 ${m.cls} whitespace-nowrap`}
+      title={`Source project: ${m.name}`}>
+      [{m.short}]
+    </span>
+  );
+}
+
 function SourceTypePill({ sourceType }: { sourceType: string | null | undefined }) {
   const key = (sourceType || '').trim();
   const meta = SOURCE_TYPE_LABEL[key];
@@ -3897,6 +4638,71 @@ function SourceTypePill({ sourceType }: { sourceType: string | null | undefined 
 // Compact indicator showing the collapsed family siblings behind a canonical.
 // Clicks toggle a popover listing each sibling with its variant suffix +
 // status + executions. Absent or zero-sibling reports render nothing.
+// Compact details panel shown under the embedding-source dropdown in the
+// Playground + Density tabs. Exposes exactly which fields went into the
+// embedding text blob so the user understands what "similar" will mean
+// for this run without having to flip to the Embeddings tab.
+function EmbeddingSetDetails({
+  set,
+  trailer,
+}: {
+  set: EmbeddingSet;
+  trailer?: string;
+}) {
+  // Human-friendly labels + a stable order so the pills read the same way
+  // every time.
+  const FIELD_LABELS: Array<[string, string]> = [
+    ['name', 'Name'],
+    ['path', 'Path'],
+    ['owner', 'Owner'],
+    ['attributes', 'Attributes'],
+    ['metrics', 'Metrics'],
+    ['tables', 'Tables'],
+    ['filters', 'Filters'],
+    ['sql', 'SQL'],
+  ];
+  const on = FIELD_LABELS.filter(([k]) => set.fields[k] === true);
+  const off = FIELD_LABELS.filter(([k]) => set.fields[k] !== true);
+  const normalize = set.fields['normalizeSql'] === true;
+  const maxSql = Number(set.fields['maxSqlChars']) || null;
+  return (
+    <div className="text-[10px] mt-1.5 space-y-1">
+      <div className="flex items-center gap-1.5 flex-wrap text-violet-200">
+        <span className="text-violet-400 uppercase font-semibold">Scope:</span>
+        <code className="bg-[#0f0f1a] px-1 rounded">{set.scope}</code>
+        <span className="text-violet-400 uppercase font-semibold">·  Source:</span>
+        <code className="bg-[#0f0f1a] px-1 rounded">{set.sourceFilter}</code>
+        <span className="text-violet-400 uppercase font-semibold">·  Model:</span>
+        <code className="bg-[#0f0f1a] px-1 rounded">{set.model.replace('text-embedding-3-', '3-')}/{set.dim}d</code>
+        <span className="text-emerald-300 font-semibold">· $0 cache hit{trailer ? ` — ${trailer}` : ''}</span>
+      </div>
+      <div className="flex items-start gap-1.5 flex-wrap">
+        <span className="text-violet-400 uppercase font-semibold shrink-0 mt-0.5">Fields embedded:</span>
+        {on.length === 0 ? (
+          <span className="italic text-gray-500">(none — embedding is just report IDs; clustering will be useless)</span>
+        ) : (
+          on.map(([k, label]) => (
+            <span key={k} className="bg-emerald-900/40 border border-emerald-700/60 text-emerald-200 rounded px-1.5 py-0.5 whitespace-nowrap">
+              ✓ {label}
+            </span>
+          ))
+        )}
+        {off.length > 0 && off.map(([k, label]) => (
+          <span key={k} className="bg-[#0f0f1a] border border-[#1e2d50] text-gray-600 rounded px-1.5 py-0.5 whitespace-nowrap line-through">
+            {label}
+          </span>
+        ))}
+      </div>
+      {set.fields['sql'] === true && (
+        <div className="text-gray-500">
+          SQL: {normalize ? 'normalized' : 'raw'}
+          {maxSql ? `, first ${maxSql.toLocaleString()} chars` : ''}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function FamilySiblingsIndicator({
   siblings,
 }: {
@@ -4241,6 +5047,280 @@ function ClusterComparisonTab({
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// CLASSIFY DOMAIN TAB
+// LLM classifies post-Jaccard reports into fixed business domains
+// ─────────────────────────────────────────────────────────────────────
+
+const CLASSIFY_DOMAIN_TAXONOMY = [
+  'Sales - DTC/Ecom',
+  'Sales - Retail',
+  'Sales - Wholesale',
+  'Inventory',
+  'Sourcing (Purchase Order)',
+  'Master Data',
+  'Unclassified',
+];
+
+const DOMAIN_COLORS: Record<string, { bg: string; border: string; text: string }> = {
+  'Sales - DTC/Ecom':         { bg: 'bg-blue-900/20',    border: 'border-blue-700/50',    text: 'text-blue-300' },
+  'Sales - Retail':           { bg: 'bg-emerald-900/20', border: 'border-emerald-700/50', text: 'text-emerald-300' },
+  'Sales - Wholesale':        { bg: 'bg-cyan-900/20',    border: 'border-cyan-700/50',    text: 'text-cyan-300' },
+  'Inventory':                { bg: 'bg-amber-900/20',   border: 'border-amber-700/50',   text: 'text-amber-300' },
+  'Sourcing (Purchase Order)':{ bg: 'bg-violet-900/20',  border: 'border-violet-700/50',  text: 'text-violet-300' },
+  'Master Data':              { bg: 'bg-pink-900/20',    border: 'border-pink-700/50',    text: 'text-pink-300' },
+  'Unclassified':             { bg: 'bg-gray-800/40',    border: 'border-gray-600/50',    text: 'text-gray-400' },
+};
+
+function ClassifyDomainTab({ projectId }: { projectId: string }) {
+  const [results, setResults] = useState<Awaited<ReturnType<typeof fetchDomainResults>> | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
+  const [taskStatus, setTaskStatus] = useState<string>('');
+  const [error, setError] = useState<string | null>(null);
+  const [expandedDomain, setExpandedDomain] = useState<string | null>(null);
+
+  async function loadResults() {
+    if (!projectId) return;
+    setLoading(true);
+    try {
+      const r = await fetchDomainResults(projectId);
+      setResults(r);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    loadResults();
+  }, [projectId]);
+
+  // Poll the task until it completes, then reload results.
+  useEffect(() => {
+    if (!activeTaskId) return;
+    let cancelled = false;
+    (async () => {
+      while (!cancelled) {
+        try {
+          const t = await fetchPlaygroundTask(activeTaskId);
+          setTaskStatus(`${t.status}${t.name ? ' · ' + t.name : ''}`);
+          if (t.status === 'completed') {
+            setRunning(false);
+            setActiveTaskId(null);
+            setTaskStatus('');
+            await loadResults();
+            return;
+          }
+          if (t.status === 'failed' || t.status === 'interrupted') {
+            setRunning(false);
+            setActiveTaskId(null);
+            setError(t.error || `Task ${t.status}`);
+            return;
+          }
+        } catch {
+          // Transient — try again next tick
+        }
+        await new Promise((r) => setTimeout(r, 3000));
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [activeTaskId]);
+
+  async function runClassification() {
+    if (!projectId || running) return;
+    setError(null);
+    setRunning(true);
+    setTaskStatus('queueing…');
+    try {
+      const task = await runDomainClassification({
+        id: `exp-classify-domain-${projectId}-post-family`,
+        name: `Classify Domain · ${projectId}`,
+        project: projectId,
+        scope: 'post-family',   // after family collapse — includes all
+                                // business-distinct reports, not just the
+                                // Jaccard survivors.
+        sourceFilter: 'all',
+        model: 'gpt-5.4',
+        taxonomy: CLASSIFY_DOMAIN_TAXONOMY,
+      });
+      if (task.status === 'failed' || task.status === 'interrupted') {
+        setRunning(false);
+        setError(task.error || `Task ${task.status}`);
+        return;
+      }
+      setActiveTaskId(task.id);
+      setTaskStatus(`${task.status} · ${task.name || task.id}`);
+    } catch (e: unknown) {
+      setRunning(false);
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  const domains = CLASSIFY_DOMAIN_TAXONOMY;
+  const byDomain = results?.byDomain || {};
+  const totalClassified = results?.totalClassified || 0;
+
+  return (
+    <div className="space-y-4">
+      {/* Intro card */}
+      <div className="bg-gradient-to-r from-violet-950/60 to-[#16213e] p-4 rounded-lg border border-violet-800/40">
+        <div className="text-xs uppercase tracking-wider text-violet-300 font-bold mb-2">
+          Classify Domain — Business Bucketing of Post-Family Reports
+        </div>
+        <p className="text-xs text-gray-400 leading-relaxed">
+          Runs GPT-5.4 over every report in the <strong>post-family canonical set</strong>{' '}
+          (scope: <code className="text-violet-300">post-family</code>) and assigns each one to one of
+          seven fixed business domains. Uses 50-report batches with 4 parallel workers for speed
+          (~8× faster than the single-stream path). Results are cached per (report, content-hash),
+          so re-running an unchanged report is a near-instant no-op.
+        </p>
+      </div>
+
+      {/* Taxonomy + run */}
+      <div className="bg-[#16213e] p-4 rounded-lg border border-[#1e2d50]">
+        <div className="flex items-center justify-between gap-4 mb-3">
+          <div>
+            <div className="text-sm font-semibold text-white mb-1">Domains</div>
+            <div className="flex flex-wrap gap-1.5">
+              {domains.map((d) => {
+                const c = DOMAIN_COLORS[d] || DOMAIN_COLORS['Unclassified'];
+                return (
+                  <span
+                    key={d}
+                    className={`text-xs px-2 py-0.5 rounded border ${c.bg} ${c.border} ${c.text}`}
+                  >
+                    {d}
+                  </span>
+                );
+              })}
+            </div>
+          </div>
+          <button
+            onClick={runClassification}
+            disabled={running || !projectId}
+            className={`px-4 py-2 rounded-lg text-sm font-semibold whitespace-nowrap ${
+              running || !projectId
+                ? 'bg-gray-700 text-gray-400 cursor-not-allowed'
+                : 'bg-violet-600 hover:bg-violet-500 text-white'
+            }`}
+          >
+            {running ? 'Classifying…' : totalClassified > 0 ? 'Re-run Classification' : 'Run Classification'}
+          </button>
+        </div>
+        {taskStatus && (
+          <div className="text-xs text-gray-400 bg-[#0f0f1a] rounded px-3 py-2 font-mono mt-2">
+            Task: {taskStatus}
+          </div>
+        )}
+        {error && (
+          <div className="text-xs text-red-300 bg-red-950/40 border border-red-800/50 rounded px-3 py-2 mt-2">
+            {error}
+          </div>
+        )}
+        <div className="text-[11px] text-gray-500 mt-2">
+          {totalClassified > 0
+            ? `${totalClassified.toLocaleString()} reports classified${results?.lastRunAt ? ' · last run ' + new Date(results.lastRunAt).toLocaleString() : ''}`
+            : 'No classification run yet for this project.'}
+        </div>
+      </div>
+
+      {/* Loading */}
+      {loading && !results && (
+        <div className="bg-[#16213e] p-8 rounded-lg text-center text-gray-400 text-sm">
+          Loading classification results…
+        </div>
+      )}
+
+      {/* Empty state */}
+      {!loading && totalClassified === 0 && (
+        <div className="bg-[#16213e] p-8 rounded-lg text-center space-y-3">
+          <div className="text-4xl">🏷️</div>
+          <h2 className="text-xl font-bold text-white">No classifications yet</h2>
+          <p className="text-sm text-gray-400 max-w-xl mx-auto">
+            Click <strong>Run Classification</strong> above to classify every post-family report
+            into the seven domains shown. Uses the cached prompt-per-report, so subsequent runs
+            are cheap.
+          </p>
+        </div>
+      )}
+
+      {/* Results */}
+      {!loading && totalClassified > 0 && (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+          {domains.map((d) => {
+            const reports = byDomain[d] || [];
+            const c = DOMAIN_COLORS[d] || DOMAIN_COLORS['Unclassified'];
+            const expanded = expandedDomain === d;
+            const totalExecs = reports.reduce((s, r) => s + (r.executions || 0), 0);
+            return (
+              <div
+                key={d}
+                className={`${c.bg} border ${c.border} rounded-lg overflow-hidden`}
+              >
+                <button
+                  type="button"
+                  onClick={() => setExpandedDomain(expanded ? null : d)}
+                  className="w-full text-left p-3 flex items-center justify-between hover:bg-black/10 transition-colors"
+                >
+                  <div>
+                    <div className={`text-sm font-semibold ${c.text}`}>{d}</div>
+                    <div className="text-xs text-gray-400 mt-0.5">
+                      {reports.length.toLocaleString()} reports · {totalExecs.toLocaleString()} execs
+                    </div>
+                  </div>
+                  <VscChevronRight className={`text-gray-400 transition-transform ${expanded ? 'rotate-90' : ''}`} />
+                </button>
+                {expanded && (
+                  <div className="max-h-[400px] overflow-y-auto border-t border-[#1e2d50] bg-[#0f0f1a]/60">
+                    {reports.length === 0 ? (
+                      <div className="p-3 text-xs text-gray-500 italic">No reports in this domain.</div>
+                    ) : (
+                      <table className="w-full text-xs">
+                        <thead className="bg-[#0f0f1a] sticky top-0">
+                          <tr>
+                            <th className="text-left p-2 text-gray-400 font-semibold uppercase">Report</th>
+                            <th className="text-right p-2 text-gray-400 font-semibold uppercase">Execs</th>
+                            <th className="text-right p-2 text-gray-400 font-semibold uppercase">Conf</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {reports.slice(0, 200).map((r) => (
+                            <tr key={r.id} className="border-t border-[#1e2d50] hover:bg-[#1a2a4a]">
+                              <td className="p-2 text-gray-200 truncate max-w-[240px]" title={r.name}>
+                                {r.name || r.id}
+                              </td>
+                              <td className="p-2 text-right text-gray-400 font-mono">
+                                {r.executions.toLocaleString()}
+                              </td>
+                              <td className="p-2 text-right text-gray-500 font-mono">
+                                {r.confidence != null ? r.confidence.toFixed(2) : '—'}
+                              </td>
+                            </tr>
+                          ))}
+                          {reports.length > 200 && (
+                            <tr>
+                              <td colSpan={3} className="p-2 text-center text-xs text-gray-500 italic">
+                                … +{(reports.length - 200).toLocaleString()} more
+                              </td>
+                            </tr>
+                          )}
+                        </tbody>
+                      </table>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // HEAVY USERS TAB
 // ─────────────────────────────────────────────────────────────────────
 
@@ -4248,24 +5328,25 @@ function HeavyUsersTab({
   users,
   search,
   setSearch,
-  showService,
-  setShowService,
+  filter,
+  setFilter,
   onOpen,
 }: {
   users: HeavyUser[];
   search: string;
   setSearch: (v: string) => void;
-  showService: boolean;
-  setShowService: (v: boolean) => void;
+  filter: 'all' | 'human' | 'service';
+  setFilter: (v: 'all' | 'human' | 'service') => void;
   onOpen: (u: HeavyUser) => void;
 }) {
   const filtered = useMemo(() => {
     let list = users;
-    if (!showService) list = list.filter((u) => !u.isService);
+    if (filter === 'human')   list = list.filter((u) => !u.isService);
+    if (filter === 'service') list = list.filter((u) => u.isService);
     const q = search.toLowerCase().trim();
     if (q) list = list.filter((u) => u.user.toLowerCase().includes(q));
     return list;
-  }, [users, showService, search]);
+  }, [users, filter, search]);
 
   const humanTotalExecs = useMemo(
     () => users.filter((u) => !u.isService).reduce((s, u) => s + u.totalExecutions, 0),
@@ -4306,39 +5387,59 @@ function HeavyUsersTab({
       </div>
 
       <div className="grid grid-cols-4 gap-4">
-        <div className="bg-[#16213e] p-4 rounded-lg border-l-4 border-blue-500">
+        {/* "All users" chip — clicking resets to both */}
+        <button
+          type="button"
+          onClick={() => setFilter('all')}
+          className={`text-left bg-[#16213e] p-4 rounded-lg border-l-4 border-violet-500 transition-all cursor-pointer ${
+            filter === 'all' ? 'ring-2 ring-violet-500 bg-violet-900/20' : 'hover:bg-[#1a2a4a]'
+          }`}
+          title="Show all users (human + service)"
+        >
+          <div className="text-xs text-gray-400 uppercase mb-1">Users (all)</div>
+          <div className="text-2xl font-bold text-white">{users.length.toLocaleString()}</div>
+          <div className="text-xs text-gray-500">click to show both</div>
+        </button>
+        <button
+          type="button"
+          onClick={() => setFilter(filter === 'human' ? 'all' : 'human')}
+          className={`text-left bg-[#16213e] p-4 rounded-lg border-l-4 border-blue-500 transition-all cursor-pointer ${
+            filter === 'human' ? 'ring-2 ring-blue-500 bg-blue-900/20' : 'hover:bg-[#1a2a4a]'
+          }`}
+          title="Show only human users"
+        >
           <div className="text-xs text-gray-400 uppercase mb-1">Users (human)</div>
           <div className="text-2xl font-bold text-white">
             {(users.length - serviceCount).toLocaleString()}
           </div>
-        </div>
-        <div className="bg-[#16213e] p-4 rounded-lg border-l-4 border-amber-500">
+          <div className="text-xs text-gray-500">
+            {humanTotalExecs.toLocaleString()} execs
+          </div>
+        </button>
+        <button
+          type="button"
+          onClick={() => setFilter(filter === 'service' ? 'all' : 'service')}
+          className={`text-left bg-[#16213e] p-4 rounded-lg border-l-4 border-amber-500 transition-all cursor-pointer ${
+            filter === 'service' ? 'ring-2 ring-amber-500 bg-amber-900/20' : 'hover:bg-[#1a2a4a]'
+          }`}
+          title="Show only service accounts"
+        >
           <div className="text-xs text-gray-400 uppercase mb-1">Users (service)</div>
           <div className="text-2xl font-bold text-white">{serviceCount}</div>
-          <div className="text-xs text-gray-500">flagged by name heuristic</div>
-        </div>
-        <div className="bg-[#16213e] p-4 rounded-lg border-l-4 border-emerald-500">
-          <div className="text-xs text-gray-400 uppercase mb-1">Human executions</div>
-          <div className="text-2xl font-bold text-white">{humanTotalExecs.toLocaleString()}</div>
-        </div>
+          <div className="text-xs text-gray-500">
+            {serviceTotalExecs.toLocaleString()} execs
+          </div>
+        </button>
         <div className="bg-[#16213e] p-4 rounded-lg border-l-4 border-slate-500">
-          <div className="text-xs text-gray-400 uppercase mb-1">Service executions</div>
-          <div className="text-2xl font-bold text-white">{serviceTotalExecs.toLocaleString()}</div>
+          <div className="text-xs text-gray-400 uppercase mb-1">Total executions</div>
+          <div className="text-2xl font-bold text-white">
+            {(humanTotalExecs + serviceTotalExecs).toLocaleString()}
+          </div>
+          <div className="text-xs text-gray-500">human + service</div>
         </div>
       </div>
 
       <div className="bg-[#16213e] p-4 rounded-lg">
-        <div className="flex gap-3 items-center mb-3">
-          <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={showService}
-              onChange={(e) => setShowService(e.target.checked)}
-              className="accent-amber-500"
-            />
-            <span>Show service accounts (ODS_PROD, dataiku, Administrator, …)</span>
-          </label>
-        </div>
         <div className="relative">
           <VscSearch className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" />
           <input
@@ -4563,7 +5664,520 @@ const PROJECT_NAME_TO_SHORT: Record<string, string> = {
   'Global Operational': 'global-operational',
   'Global Insight': 'global-insight',
   'INSIGHT': 'insight',
+  'Combined Reports Project': 'combined-reports',
 };
+
+// ─────────────────────────────────────────────────────────────────────
+// EMBEDDINGS TAB — named embedding sets that clustering methods reuse
+// ─────────────────────────────────────────────────────────────────────
+
+function EmbeddingsTab({
+  projectId,
+  projectName,
+}: {
+  projectId: string;
+  projectName: string;
+}) {
+  const currentShortId = PROJECT_NAME_TO_SHORT[projectName] || '';
+
+  const DEFAULT_FORM = {
+    name: '',
+    scope: 'post-family',
+    sourceFilter: 'all',
+    domainFilter: 'all',
+    model: 'text-embedding-3-large',
+    dim: 3072,
+    fields: {
+      name: true, path: true, owner: false,
+      attributes: true, metrics: true, tables: true, filters: true,
+      sql: true, normalizeSql: true, maxSqlChars: 2000,
+    } as Record<string, boolean | number>,
+  };
+  const [form, setForm] = usePersistentState('embeddings.form.v1', DEFAULT_FORM);
+  // Available domains come from the most recent Classify Domain run for
+  // this project. When the project has no classifications, the dropdown
+  // only shows "All domains" (plus a hint to run Classify Domain first).
+  const [availableDomains, setAvailableDomains] = useState<{ name: string; count: number }[]>([]);
+  useEffect(() => {
+    if (!projectId) { setAvailableDomains([]); return; }
+    fetchDomainResults(projectId).then((r) => {
+      const rows = Object.entries(r.byDomain || {}).map(([name, reps]) => ({
+        name, count: (reps as unknown as unknown[]).length,
+      }));
+      rows.sort((a, b) => b.count - a.count);
+      setAvailableDomains(rows);
+    }).catch(() => setAvailableDomains([]));
+  }, [projectId]);
+  const patchForm = (p: Partial<typeof form>) => setForm((f) => ({ ...f, ...p }));
+  const toggleField = (k: string) => patchForm({ fields: { ...form.fields, [k]: !form.fields[k] } });
+
+  const [sets, setSets] = useState<EmbeddingSet[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [showAllProjects, setShowAllProjects] = usePersistentState<boolean>('embeddings.showAll', false);
+  const [preview, setPreview] = useState<EmbeddingSetPreview | null>(null);
+  const [previewing, setPreviewing] = useState(false);
+
+  const [activeTask, setActiveTask] = useState<PlaygroundTask | null>(null);
+  const [activeTaskId, setActiveTaskId] = usePersistentState<string | null>('embeddings.activeTaskId', null);
+  const [runStartedAt, setRunStartedAt] = useState<number | null>(null);
+  const [sidecarOk, setSidecarOk] = useState<boolean | null>(null);
+  const [apiKeySet, setApiKeySet] = useState<boolean | null>(null);
+  const pollRef = useRef<number | null>(null);
+
+  type LogEntry = { ts: string; level: 'info' | 'ok' | 'warn' | 'err'; msg: string };
+  const [runLog, setRunLog] = useState<LogEntry[]>([]);
+  const appendLog = (level: LogEntry['level'], msg: string) => {
+    const ts = new Date().toISOString().slice(11, 19);
+    setRunLog((prev) => [...prev.slice(-199), { ts, level, msg }]);
+  };
+  const clearLog = () => setRunLog([]);
+
+  // ---- load list + health on project change ----------------------
+  const loadList = async () => {
+    setLoading(true);
+    try {
+      const rows = await fetchEmbeddingSets(showAllProjects ? undefined : (currentShortId || undefined));
+      setSets(rows);
+    } finally {
+      setLoading(false);
+    }
+  };
+  useEffect(() => {
+    loadList();
+    checkPlaygroundHealth().then((h) => {
+      setSidecarOk(h !== null);
+      setApiKeySet(h?.openai_key_set ?? null);
+    });
+    if (activeTaskId) {
+      fetchPlaygroundTask(activeTaskId).then((t) => { if (t) setActiveTask(t); });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, currentShortId, showAllProjects]);
+
+  // ---- debounced cost preview whenever form changes --------------
+  useEffect(() => {
+    if (!projectId) { setPreview(null); return; }
+    const handle = window.setTimeout(async () => {
+      setPreviewing(true);
+      try {
+        const cfg = {
+          name: form.name || 'preview',
+          project: projectId,
+          scope: form.scope, sourceFilter: form.sourceFilter,
+          domainFilter: form.domainFilter,
+          model: form.model, dimensions: form.dim,
+          fields: form.fields,
+        };
+        const p = await previewEmbeddingSet(cfg);
+        setPreview(p);
+      } finally {
+        setPreviewing(false);
+      }
+    }, 400);
+    return () => window.clearTimeout(handle);
+  }, [projectId, form.scope, form.sourceFilter, form.domainFilter, form.model, form.dim,
+      // JSON-stringify the fields so React effect deps stay shallow
+      JSON.stringify(form.fields)]);
+
+  // ---- task polling ---------------------------------------------
+  useEffect(() => {
+    if (!activeTask || activeTask.status !== 'running') {
+      if (pollRef.current) { window.clearInterval(pollRef.current); pollRef.current = null; }
+      return;
+    }
+    const tick = async () => {
+      const t = await fetchPlaygroundTask(activeTask.id);
+      if (!t) return;
+      setActiveTask(t);
+      if (t.status === 'completed') {
+        appendLog('ok', `✓ Embedding set created/refreshed.`);
+        await loadList();
+        setActiveTaskId(null);
+        setRunStartedAt(null);
+        setActiveTask(null);
+      } else if (t.status === 'failed' || t.status === 'interrupted') {
+        appendLog('err', `✗ Task ${t.status}: ${t.error || 'no detail'}`);
+        setActiveTaskId(null);
+        setRunStartedAt(null);
+      } else {
+        appendLog('info', `poll: status=${t.status}`);
+      }
+    };
+    pollRef.current = window.setInterval(tick, 2000);
+    tick();
+    return () => {
+      if (pollRef.current) { window.clearInterval(pollRef.current); pollRef.current = null; }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTask?.id, activeTask?.status]);
+
+  const running = activeTask?.status === 'running';
+  const runElapsed = runStartedAt ? Math.floor((Date.now() - runStartedAt) / 1000) : 0;
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!running) return;
+    const id = window.setInterval(() => setTick((x) => x + 1), 1000);
+    return () => window.clearInterval(id);
+  }, [running]);
+
+  // ---- run + delete ---------------------------------------------
+  async function handleRun() {
+    // Diagnostic: this line fires unconditionally so we can tell from the
+    // run-log panel whether the click is even reaching the handler (vs.
+    // being swallowed by a disabled button or a stale bundle).
+    const clickTs = new Date().toISOString().slice(11, 19);
+    console.log('[embeddings] handleRun fired', { name: form.name, projectId, sidecarOk, apiKeySet });
+    appendLog('info', `button clicked @ ${clickTs}  (project=${projectId || '(none)'}, sidecar=${String(sidecarOk)}, apiKey=${String(apiKeySet)})`);
+
+    // Fall back to the auto-suggested name if the user didn't type one.
+    let name = (form.name || '').trim();
+    if (!name) {
+      name = suggestedName;
+      patchForm({ name });
+      appendLog('info', `No name typed — using suggested "${name}".`);
+    }
+    if (!projectId) {
+      appendLog('err', 'No project selected. Pick one from the sidebar.');
+      return;
+    }
+    clearLog();
+    setRunStartedAt(Date.now());
+    appendLog('info', `▶ Creating embedding set "${name}"`);
+    if (preview) {
+      appendLog('info', `  ${preview.totalReports} reports · ${preview.cached} cached · ${preview.new} new calls · ~$${preview.estimatedCostUsd.toFixed(4)}`);
+    }
+    appendLog('info', `POST ${window.location.origin}/playground_api/embeddings/run …`);
+    try {
+      const task = await runEmbeddingSet({
+        name, project: projectId,
+        scope: form.scope, sourceFilter: form.sourceFilter,
+        domainFilter: form.domainFilter,
+        model: form.model, dimensions: form.dim,
+        fields: form.fields,
+      });
+      appendLog('info', `  POST returned`);
+      if (task.status === 'failed' || task.status === 'interrupted') {
+        appendLog('err', `✗ Task failed at creation: ${task.error || 'no detail'}`);
+        setRunStartedAt(null);
+        return;
+      }
+      appendLog('ok', `✓ Task queued: ${task.id}`);
+      setActiveTask(task);
+      setActiveTaskId(task.id);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      appendLog('err', `✗ POST failed: ${msg}`);
+      setRunStartedAt(null);
+    }
+  }
+
+  async function handleDelete(name: string) {
+    if (!window.confirm(`Delete embedding set "${name}"? The underlying vectors stay in the cache.`)) return;
+    await deleteEmbeddingSet(name);
+    appendLog('info', `Removed "${name}" (cached vectors untouched).`);
+    await loadList();
+  }
+
+  // Auto-suggest a name based on fields + model when the field empty
+  const suggestedName = useMemo(() => {
+    const on = Object.entries(form.fields)
+      .filter(([k, v]) => typeof v === 'boolean' && v && k !== 'normalizeSql')
+      .map(([k]) => k);
+    const fieldTag = on.length === 0 ? 'nofield'
+                   : on.length === 9 ? 'full'
+                   : on.slice(0, 3).join('-');
+    const modelTag = form.model.includes('large') ? 'lg' : 'sm';
+    return `${currentShortId || 'proj'}-${fieldTag}-${modelTag}-${form.dim}`;
+  }, [form.fields, form.model, form.dim, currentShortId]);
+
+  return (
+    <div className="space-y-4">
+      <div className="bg-gradient-to-r from-violet-950/60 to-[#16213e] p-4 rounded-lg border border-violet-800/40">
+        <div className="text-xs uppercase tracking-wider text-violet-300 font-bold mb-2">
+          Embeddings — the asset layer that clustering builds on
+        </div>
+        <p className="text-xs text-gray-400 leading-relaxed">
+          An embedding turns each report's text (name, path, metrics, etc.) into a high-dim vector. It's the expensive
+          step — once computed, <strong className="text-violet-300">Semantic</strong>, <strong className="text-cyan-300">Density</strong>,
+          and other clustering methods reuse it for free. Create named sets here, then reference them from the clustering tabs.
+          The cache is shared — if another run already embedded the same text with the same model/dim, this is a zero-cost lookup.
+        </p>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
+        {/* Left: config form */}
+        <div className="lg:col-span-2 bg-[#16213e] p-5 rounded-lg border border-violet-900/40">
+          <h3 className="text-white font-bold mb-3">Define an Embedding Set</h3>
+          <div className="space-y-3 text-sm">
+            <div>
+              <label className="block text-xs text-gray-400 uppercase mb-1">Name</label>
+              <input
+                value={form.name}
+                onChange={(e) => patchForm({ name: e.target.value })}
+                placeholder={suggestedName}
+                className="w-full bg-[#0f0f1a] border border-[#1e2d50] rounded px-3 py-2 text-white text-sm"
+              />
+              <div className="text-[10px] text-gray-500 mt-1">
+                Unique name. Suggested: <code className="text-violet-300">{suggestedName}</code>
+                {' '}
+                <button onClick={() => patchForm({ name: suggestedName })}
+                  className="text-[10px] text-violet-300 hover:text-white underline ml-1">use</button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-3 gap-3">
+              <div>
+                <label className="block text-xs text-gray-400 uppercase mb-1">Scope</label>
+                <select value={form.scope} onChange={(e) => patchForm({ scope: e.target.value })}
+                  className="w-full bg-[#0f0f1a] border border-[#1e2d50] rounded px-2 py-1.5 text-white text-sm">
+                  <option value="post-family">post-family</option>
+                  <option value="post-ast">post-AST</option>
+                  <option value="active">active</option>
+                  <option value="final-kept">final-kept</option>
+                  <option value="post-collision">post-collision</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs text-gray-400 uppercase mb-1">Source filter</label>
+                <select value={form.sourceFilter} onChange={(e) => patchForm({ sourceFilter: e.target.value })}
+                  className="w-full bg-[#0f0f1a] border border-[#1e2d50] rounded px-2 py-1.5 text-white text-sm">
+                  <option value="all">All sources</option>
+                  <option value="normal">SQL only</option>
+                  <option value="cube">Cube only</option>
+                  <option value="custom_sql_free_form">Free SQL only</option>
+                  <option value="exclude-cube">Exclude cubes</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs text-gray-400 uppercase mb-1">
+                  Business domain
+                  {availableDomains.length === 0 && (
+                    <span className="text-[9px] text-amber-400 ml-1 normal-case" title="No classification data for this project yet — run Classify Domain first.">
+                      · none classified
+                    </span>
+                  )}
+                </label>
+                <select
+                  value={form.domainFilter}
+                  onChange={(e) => patchForm({ domainFilter: e.target.value })}
+                  disabled={availableDomains.length === 0}
+                  className="w-full bg-[#0f0f1a] border border-[#1e2d50] rounded px-2 py-1.5 text-white text-sm disabled:opacity-50"
+                >
+                  <option value="all">All domains</option>
+                  {availableDomains.map((d) => (
+                    <option key={d.name} value={d.name}>
+                      {d.name} ({d.count.toLocaleString()})
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-xs text-gray-400 uppercase mb-1">Fields embedded</label>
+              <div className="grid grid-cols-3 gap-1.5 text-xs">
+                {[
+                  ['name', 'Report name'],
+                  ['path', 'Folder path'],
+                  ['owner', 'Owner'],
+                  ['attributes', 'Attributes'],
+                  ['metrics', 'Metrics'],
+                  ['tables', 'Tables'],
+                  ['filters', 'Filters'],
+                  ['sql', 'SQL text'],
+                  ['normalizeSql', 'Normalize SQL'],
+                ].map(([k, label]) => (
+                  <label key={k} className="flex items-center gap-1.5 cursor-pointer text-gray-300 hover:text-white">
+                    <input type="checkbox" checked={!!form.fields[k]} onChange={() => toggleField(k)} />
+                    <span>{label}</span>
+                  </label>
+                ))}
+              </div>
+              {form.fields.sql && (
+                <div className="mt-2 flex items-center gap-2 text-xs text-gray-400">
+                  <span>max SQL chars:</span>
+                  <input type="number" min={100} max={8000} step={100}
+                    value={Number(form.fields.maxSqlChars) || 2000}
+                    onChange={(e) => patchForm({ fields: { ...form.fields, maxSqlChars: parseInt(e.target.value) || 2000 } })}
+                    className="w-24 bg-[#0f0f1a] border border-[#1e2d50] rounded px-2 py-1 text-white" />
+                </div>
+              )}
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs text-gray-400 uppercase mb-1">Model</label>
+                <select value={form.model} onChange={(e) => {
+                  const m = e.target.value;
+                  patchForm({ model: m, ...(m.includes('small') ? { dim: 1536 } : {}) });
+                }}
+                  className="w-full bg-[#0f0f1a] border border-[#1e2d50] rounded px-2 py-1.5 text-white text-sm">
+                  <option value="text-embedding-3-large">3-large (3072d)</option>
+                  <option value="text-embedding-3-small">3-small (1536d, cheaper)</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs text-gray-400 uppercase mb-1">Dim</label>
+                <select value={form.dim} onChange={(e) => patchForm({ dim: parseInt(e.target.value) })}
+                  className="w-full bg-[#0f0f1a] border border-[#1e2d50] rounded px-2 py-1.5 text-white text-sm">
+                  {form.model.includes('large') && <option value={3072}>3072 (full)</option>}
+                  <option value={1536}>1536</option>
+                  <option value={768}>768</option>
+                </select>
+              </div>
+            </div>
+
+            {/* Live cost preview */}
+            <div className="pt-2 border-t border-[#1e2d50] text-xs">
+              <div className="text-[10px] uppercase text-gray-500 mb-1">Cost preview</div>
+              {!preview && !previewing && (
+                <div className="text-gray-500 italic">pick a project to preview</div>
+              )}
+              {previewing && (
+                <div className="text-gray-400">computing…</div>
+              )}
+              {preview && !previewing && (
+                <div className="flex items-center flex-wrap gap-2">
+                  <span className="text-gray-400">{preview.totalReports.toLocaleString()} reports</span>
+                  <span className="text-gray-600">·</span>
+                  <span className="text-emerald-300">{preview.cached.toLocaleString()} cached</span>
+                  <span className="text-gray-600">·</span>
+                  <span className={preview.new === 0 ? 'text-emerald-300' : 'text-amber-300 font-semibold'}>
+                    {preview.new.toLocaleString()} new
+                  </span>
+                  <span className="text-gray-600">·</span>
+                  <span className={preview.estimatedCostUsd === 0 ? 'text-emerald-300 font-semibold' : 'text-amber-300 font-semibold'}>
+                    ~${preview.estimatedCostUsd.toFixed(4)}
+                  </span>
+                </div>
+              )}
+            </div>
+
+            <div className="text-[11px] text-gray-500 pt-1">
+              {sidecarOk === null ? 'Checking sidecar…' : sidecarOk
+                ? <span className="text-emerald-300">Sidecar connected · OpenAI key {apiKeySet ? 'set ✓' : 'MISSING ✗'}</span>
+                : <span className="text-red-300">Sidecar not running.</span>}
+            </div>
+
+            <div className="flex gap-2 items-start">
+              <button onClick={handleRun}
+                disabled={running || sidecarOk === false || apiKeySet === false}
+                className="bg-violet-600 hover:bg-violet-500 disabled:bg-violet-900 disabled:text-gray-500 disabled:cursor-not-allowed text-white text-sm font-semibold px-5 py-2.5 rounded flex items-center gap-2"
+                title={
+                  sidecarOk === false ? 'Start the sidecar first (python playground_server.py)' :
+                  apiKeySet === false ? 'OPENAI_API_KEY missing on server' :
+                  !form.name.trim() ? `Will use suggested name "${suggestedName}"` :
+                  'Create the named embedding set'
+                }>
+                {running ? (
+                  <><span className="animate-spin inline-block w-4 h-4 border-2 border-white border-t-transparent rounded-full"></span>
+                  Running… <span className="text-xs font-normal opacity-80">({runElapsed}s)</span></>
+                ) : <>▶ Create Embedding Set</>}
+              </button>
+              <button onClick={() => setForm(DEFAULT_FORM)}
+                disabled={running}
+                className="bg-[#0f0f1a] hover:bg-[#1a2a4a] disabled:opacity-40 text-gray-300 text-sm font-semibold px-4 py-2 rounded border border-[#1e2d50]">
+                Reset
+              </button>
+              {/* Visible reason when the button is disabled, so user understands why */}
+              {(sidecarOk === false || apiKeySet === false) && (
+                <div className="text-[11px] text-red-300 self-center">
+                  {sidecarOk === false
+                    ? '⚠ Sidecar offline — start it with python playground_server.py'
+                    : '⚠ OPENAI_API_KEY missing in .env.local'}
+                </div>
+              )}
+              {sidecarOk && apiKeySet && !form.name.trim() && (
+                <div className="text-[11px] text-gray-400 self-center">
+                  Leave the name empty and I'll use <code className="text-violet-300">{suggestedName}</code>
+                </div>
+              )}
+            </div>
+
+            {runLog.length > 0 && (
+              <div className="bg-[#0f0f1a] border border-violet-700/40 rounded max-h-48 overflow-auto p-2 text-[10px] font-mono">
+                {runLog.map((l, i) => (
+                  <div key={i} className={
+                    l.level === 'err' ? 'text-red-300' :
+                    l.level === 'warn' ? 'text-amber-300' :
+                    l.level === 'ok' ? 'text-emerald-300' : 'text-gray-400'
+                  }>
+                    <span className="text-gray-600">{l.ts}</span> {l.msg}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Right: list of existing embedding sets */}
+        <div className="lg:col-span-3 bg-[#16213e] p-5 rounded-lg border border-violet-900/40">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-white font-bold">
+              Saved Embedding Sets
+              <span className="text-sm text-gray-400 font-normal ml-2">({sets.length})</span>
+            </h3>
+            <div className="flex items-center gap-2">
+              <label className="flex items-center gap-1.5 text-[11px] text-gray-400 cursor-pointer">
+                <input type="checkbox" checked={showAllProjects}
+                  onChange={(e) => setShowAllProjects(e.target.checked)} />
+                All projects
+              </label>
+              <button onClick={loadList}
+                className="text-[11px] text-gray-400 hover:text-white border border-[#1e2d50] rounded px-2 py-1">↻</button>
+            </div>
+          </div>
+          {loading ? (
+            <div className="text-xs text-gray-500 py-4">Loading…</div>
+          ) : sets.length === 0 ? (
+            <div className="text-xs text-gray-500 py-4">
+              No saved embedding sets for this project yet. Define one on the left.
+            </div>
+          ) : (
+            <div className="space-y-2 max-h-[70vh] overflow-y-auto pr-1">
+              {sets.map((s) => {
+                const onFields = Object.entries(s.fields)
+                  .filter(([k, v]) => typeof v === 'boolean' && v && k !== 'normalizeSql')
+                  .map(([k]) => k);
+                return (
+                  <div key={s.name} className="bg-[#0f0f1a] p-3 rounded border-l-4 border-violet-500">
+                    <div className="flex items-start justify-between gap-2 mb-1">
+                      <div className="min-w-0 flex-1">
+                        <div className="text-sm text-white font-semibold truncate">{s.name}</div>
+                        <div className="text-[11px] text-gray-500 font-mono truncate">
+                          {s.projectId} · {s.scope} · src:{s.sourceFilter}
+                        </div>
+                      </div>
+                      <button onClick={() => handleDelete(s.name)}
+                        className="text-xs text-red-400 hover:text-red-300"
+                        title="Remove this set (vectors stay cached)">✕</button>
+                    </div>
+                    <div className="flex items-center gap-2 flex-wrap text-[11px]">
+                      <span className="px-1.5 py-0.5 rounded bg-[#16213e] text-violet-300 font-mono">
+                        {s.model.replace('text-embedding-3-', '3-')}/{s.dim}d
+                      </span>
+                      <span className="px-1.5 py-0.5 rounded bg-[#16213e] text-gray-300">
+                        {s.reportCount.toLocaleString()} reports
+                      </span>
+                      {onFields.length > 0 && (
+                        <span className="px-1.5 py-0.5 rounded bg-[#16213e] text-gray-400" title={onFields.join(', ')}>
+                          fields: {onFields.length <= 3 ? onFields.join(',') : `${onFields.slice(0, 2).join(',')}+${onFields.length - 2}`}
+                        </span>
+                      )}
+                      <span className="text-gray-500 ml-auto">
+                        {s.refreshedAt ? new Date(s.refreshedAt).toLocaleDateString() : new Date(s.createdAt).toLocaleDateString()}
+                      </span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function AiPlaygroundTab({ projectId, projectName, reportById, onActiveChanged }: { projectId: string; projectName: string; reportById: Map<string, ReportDetail>; onActiveChanged?: () => void }) {
   // Which cluster (if any) is expanded in the results pane
@@ -4571,12 +6185,7 @@ function AiPlaygroundTab({ projectId, projectName, reportById, onActiveChanged }
   // Scope toggle — filter experiments to this project or show all
   const [showAllProjects, setShowAllProjects] = usePersistentState<boolean>('ai-playground.showAllProjects', false);
   // ===== Persistent form config (localStorage-backed, survives reload) =====
-  const [formConfig, setFormConfig] = usePersistentState<{
-    expName: string; scope: string; sourceFilter: string;
-    model: string; dim: number; threshold: number;
-    minSize: number; limit: number | null;
-    fields: Record<string, boolean | number>;
-  }>('ai-playground.form.v2', {
+  const DEFAULT_FORM = {
     expName: 'my-experiment',
     scope: 'post-family',
     sourceFilter: 'all',
@@ -4584,19 +6193,36 @@ function AiPlaygroundTab({ projectId, projectName, reportById, onActiveChanged }
     dim: 3072,
     threshold: 0.85,
     minSize: 2,
-    limit: null,
+    limit: null as number | null,
     fields: {
       name: true, path: true, owner: false,
       attributes: true, metrics: true, tables: true, filters: true,
       sql: true, normalizeSql: true, maxSqlChars: 2000,
-    },
-  });
+    } as Record<string, boolean | number>,
+  };
+  const [formConfig, setFormConfig] = usePersistentState<typeof DEFAULT_FORM>(
+    'ai-playground.form.v2', DEFAULT_FORM,
+  );
   const patchForm = (patch: Partial<typeof formConfig>) => setFormConfig((f) => ({ ...f, ...patch }));
   const { expName, scope, sourceFilter, model, dim, threshold, minSize, limit, fields } = formConfig;
+  // "New experiment" button resets every field to its default so the user
+  // can start fresh instead of editing the prior run's values.
+  const resetForm = () => {
+    setFormConfig({ ...DEFAULT_FORM, fields: { ...DEFAULT_FORM.fields } });
+  };
 
   // Persist selection + active run so tab switches restore immediately.
   const [selectedExpId, setSelectedExpId] = usePersistentState<string | null>('ai-playground.selectedExpId', null);
   const [activeTaskId, setActiveTaskId] = usePersistentState<string | null>('ai-playground.activeTaskId', null);
+
+  // Phase 2 — saved embedding sets the user can reference to skip
+  // re-embedding. Empty string means "build an embedding inline from the
+  // fields/model/dim below" (legacy behavior).
+  const [embeddingSetName, setEmbeddingSetName] = usePersistentState<string>(
+    'ai-playground.embeddingSetName', '',
+  );
+  const [embeddingSets, setEmbeddingSets] = useState<EmbeddingSet[]>([]);
+  const selectedSet = embeddingSets.find((s) => s.name === embeddingSetName) || null;
 
   // Ephemeral UI state (safe to reset on unmount — we recover from the above)
   const [selectedExp, setSelectedExp] = useState<PlaygroundExperiment | null>(null);
@@ -4609,24 +6235,6 @@ function AiPlaygroundTab({ projectId, projectName, reportById, onActiveChanged }
   const [apiKeySet, setApiKeySet] = useState<boolean | null>(null);
   const pollRef = useRef<number | null>(null);
 
-  // Auto-increment a trailing number in an experiment name so users can
-  // iterate without retyping. "Experiment GO - 01" → "Experiment GO - 02",
-  // "my-experiment" → "my-experiment-2", "test-5" → "test-6".
-  function nextExperimentName(name: string): string {
-    const trimmed = (name || '').trimEnd();
-    // Match a trailing number (possibly zero-padded), preserving any
-    // separator (space, dash, colon) before it.
-    const m = trimmed.match(/^(.*?)(\d+)$/);
-    if (m) {
-      const prefix = m[1];
-      const numStr = m[2];
-      const next = parseInt(numStr, 10) + 1;
-      const padded = String(next).padStart(numStr.length, '0');
-      return prefix + padded;
-    }
-    // Otherwise append " -2" or "-2" style
-    return trimmed + '-2';
-  }
 
   // Step-by-step run log — visible in the UI so the user sees exactly
   // what happens when they click Run (helps a lot when things go wrong).
@@ -4669,6 +6277,22 @@ function AiPlaygroundTab({ projectId, projectName, reportById, onActiveChanged }
     }
   };
 
+  // Phase 2 — pull saved embedding sets for this project so the user can
+  // reference one instead of re-defining fields/model/dim inline.
+  const loadEmbeddingSets = async () => {
+    if (!currentShortId) { setEmbeddingSets([]); return; }
+    try {
+      const rows = await fetchEmbeddingSets(currentShortId);
+      setEmbeddingSets(rows);
+      // If the picked set is gone (deleted in Embeddings tab), clear it.
+      if (embeddingSetName && !rows.find((r) => r.name === embeddingSetName)) {
+        setEmbeddingSetName('');
+      }
+    } catch {
+      setEmbeddingSets([]);
+    }
+  };
+
   async function handleMakePrimary(expId: string) {
     if (!currentShortId) return;
     try {
@@ -4676,9 +6300,30 @@ function AiPlaygroundTab({ projectId, projectName, reportById, onActiveChanged }
       setActiveExpId(expId);
       onActiveChanged?.();
       appendLog('ok', `✓ "${expId}" is now the primary semantic clustering for ${currentShortId}. Go to the Semantic Clusters tab to see it.`);
+      // Note: LLM review is NOT auto-triggered. Use the "🤖 LLM Review"
+      // button on each experiment card when you actually want the GPT pass.
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       appendLog('err', `✗ Could not promote: ${msg}`);
+    }
+  }
+
+  async function handleRunLlmReview(expId: string) {
+    if (!projectId) return;
+    try {
+      appendLog('info', `POST /playground_api/exp/${expId}/llm_review …`);
+      const task = await runExperimentLlmReview(expId, projectId);
+      if (task.status === 'failed' || task.status === 'interrupted') {
+        appendLog('err', `✗ LLM review failed at creation: ${task.error || 'no detail'}`);
+        return;
+      }
+      appendLog('ok', `✓ LLM review queued: ${task.id}. Polls every 2s.`);
+      setActiveTask(task);
+      setActiveTaskId(task.id);
+      setRunStartedAt(Date.now());
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      appendLog('err', `✗ LLM review POST failed: ${msg}`);
     }
   }
 
@@ -4701,6 +6346,7 @@ function AiPlaygroundTab({ projectId, projectName, reportById, onActiveChanged }
   useEffect(() => {
     loadList();
     loadActive();
+    loadEmbeddingSets();
     checkPlaygroundHealth().then((h) => {
       setSidecarOk(h !== null);
       setApiKeySet(h?.openai_key_set ?? null);
@@ -4744,30 +6390,37 @@ function AiPlaygroundTab({ projectId, projectName, reportById, onActiveChanged }
       }
       setActiveTask(t);
       if (t.status === 'completed') {
+        const isLlmReview = (t as { mode?: string }).mode === 'llm_review';
         appendLog('ok', `✓ Task completed in ${Math.floor((Date.now() - (runStartedAt || Date.now())) / 1000)}s`);
         if (t.expId) appendLog('info', `  experiment id: ${t.expId}`);
         setActiveTaskId(null);
         setRunStartedAt(null);
+        // Always refresh the list so llmReviewedAt + llmReviewSummary badges update.
+        await loadList();
         if (t.expId) {
           appendLog('info', `Loading result …`);
           setSelectedExpId(t.expId);
           const e = await fetchPlaygroundExperiment(t.expId);
           if (e) {
             setSelectedExp(e);
-            appendLog('ok', `✓ Result loaded: ${e.stats.multiClusters} multi-clusters, ${e.stats.singletons} singletons, ${e.stats.finalUnique} unique`);
+            if (isLlmReview) {
+              appendLog('ok', `✓ LLM review finished. Refresh the Semantic Clusters tab to see labels & actions.`);
+              onActiveChanged?.();
+            } else {
+              appendLog('ok', `✓ Result loaded: ${e.stats.multiClusters} multi-clusters, ${e.stats.singletons} singletons, ${e.stats.finalUnique} unique`);
+            }
           } else {
             appendLog('warn', `result file not found for ${t.expId}`);
           }
         }
-        // Advance the experiment name so the next run is a fresh experiment
-        // without the user having to retype. "Experiment GO - 01" → "- 02", etc.
-        const nextName = nextExperimentName(expName);
-        if (nextName !== expName) {
-          patchForm({ expName: nextName });
-          appendLog('info', `Next experiment name pre-filled: "${nextName}"`);
+        // After a successful run (but NOT an LLM-review task, which just
+        // annotates an existing experiment), reset the form to defaults so
+        // the user starts fresh instead of editing the last run's values.
+        // The result is already in the registry; the config is not lost.
+        if (!isLlmReview) {
+          resetForm();
+          appendLog('info', `Form reset — ready for a new experiment.`);
         }
-        appendLog('info', `Refreshing experiment list …`);
-        await loadList();
         appendLog('ok', `✓ Done.`);
       } else if (t.status === 'failed' || t.status === 'interrupted') {
         appendLog('err', `✗ Task ${t.status}: ${t.error || 'no detail'}`);
@@ -4794,11 +6447,16 @@ function AiPlaygroundTab({ projectId, projectName, reportById, onActiveChanged }
   const slug = (expName || 'experiment').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'experiment';
   const expId = `exp-${slug}-${scope}-${sourceFilter}-${model.includes('large') ? 'lg' : 'sm'}-d${dim}-thr${Math.round(threshold * 100)}`;
 
+  // When the user picks an embedding set, we still send scope/fields/etc
+  // so the backend can fall back gracefully if the set is missing — but
+  // the backend's resolve_config_from_set will override them with the
+  // stored values to guarantee cache hits.
   const config = {
     id: expId, name: expName,
     project: projectId, scope, sourceFilter,
     model, dimensions: dim, threshold, minClusterSize: minSize,
     fields, ...(limit ? { limit } : {}),
+    ...(embeddingSetName ? { embeddingSetName } : {}),
   };
 
   const running = activeTask?.status === 'running';
@@ -4916,6 +6574,37 @@ function AiPlaygroundTab({ projectId, projectName, reportById, onActiveChanged }
           <h3 className="text-white font-bold mb-3">Configure Experiment</h3>
 
           <div className="space-y-3 text-sm">
+            {/* Phase 2: choose a saved embedding set (skips re-embedding) */}
+            <div className="p-2 rounded border border-violet-800/40 bg-violet-950/20">
+              <label className="block text-[10px] uppercase tracking-wider text-violet-300 font-bold mb-1">
+                Embedding source
+              </label>
+              {embeddingSets.length === 0 ? (
+                <div className="text-[11px] text-gray-500">
+                  No saved embedding sets for this project yet. Create one on the <strong className="text-violet-300">Embeddings</strong> tab
+                  to reuse across runs. (This form will build one inline for now.)
+                </div>
+              ) : (
+                <>
+                  <select
+                    value={embeddingSetName}
+                    onChange={(e) => setEmbeddingSetName(e.target.value)}
+                    className="w-full bg-[#0f0f1a] border border-violet-700/50 rounded px-2 py-1.5 text-white text-sm"
+                  >
+                    <option value="">Build inline from the fields below (legacy)</option>
+                    {embeddingSets.map((s) => (
+                      <option key={s.name} value={s.name}>
+                        {s.name} — {s.reportCount.toLocaleString()} reports · {s.model.replace('text-embedding-3-', '3-')}/{s.dim}d
+                      </option>
+                    ))}
+                  </select>
+                  {selectedSet && (
+                    <EmbeddingSetDetails set={selectedSet} />
+                  )}
+                </>
+              )}
+            </div>
+
             <div>
               <label className="block text-xs text-gray-400 uppercase mb-1">Name</label>
               <input
@@ -4929,6 +6618,7 @@ function AiPlaygroundTab({ projectId, projectName, reportById, onActiveChanged }
               </div>
             </div>
 
+            <div className={selectedSet ? 'opacity-40 pointer-events-none' : ''}>
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <label className="block text-xs text-gray-400 uppercase mb-1">Scope</label>
@@ -5004,7 +6694,9 @@ function AiPlaygroundTab({ projectId, projectName, reportById, onActiveChanged }
                 </select>
               </div>
             </div>
+            </div>{/* end of `selectedSet` disable-wrapper — embedding fields only */}
 
+            {/* Clustering knobs — always editable, even when a saved embedding is picked */}
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <label className="block text-xs text-gray-400 uppercase mb-1">
@@ -5087,6 +6779,20 @@ function AiPlaygroundTab({ projectId, projectName, reportById, onActiveChanged }
               <button onClick={loadList}
                 className="bg-[#0f0f1a] hover:bg-[#1a2a4a] text-gray-300 text-sm font-semibold px-4 py-2 rounded border border-[#1e2d50]">
                 ↻ Refresh list
+              </button>
+              <button
+                onClick={() => {
+                  if (running) return;
+                  if (window.confirm('Reset the form to defaults? Current experiment values will be cleared.')) {
+                    resetForm();
+                    appendLog('info', 'Form reset to defaults.');
+                  }
+                }}
+                disabled={running}
+                className="bg-[#0f0f1a] hover:bg-[#1a2a4a] disabled:opacity-40 disabled:cursor-not-allowed text-gray-300 text-sm font-semibold px-4 py-2 rounded border border-[#1e2d50]"
+                title="Reset form to defaults — use this after a completed run to start a fresh experiment without inheriting the last config"
+              >
+                🆕 New
               </button>
               <details className="ml-auto">
                 <summary className="cursor-pointer text-xs text-gray-500 hover:text-gray-300 py-2">
@@ -5198,11 +6904,17 @@ function AiPlaygroundTab({ projectId, projectName, reportById, onActiveChanged }
                 const isSelected = selectedExp?.id === e.id;
                 const isActive = activeExpId === e.id;
                 const canPromote = e.project === currentShortId; // same-project only
-                const isDomain = (e.config as { mode?: string })?.mode === 'domain';
+                const mode = (e.config as { mode?: string })?.mode;
+                const isDomain = mode === 'domain';
+                const isDensity = mode === 'density';
+                const cfgEmbSet = (e.config as { embeddingSetName?: string })?.embeddingSetName;
                 return (
                   <div key={e.id}
                     className={`p-3 rounded border-l-4 ${
-                      isActive ? 'border-amber-400' : (isDomain ? 'border-sky-500' : 'border-fuchsia-500')
+                      isActive ? 'border-amber-400'
+                        : isDomain ? 'border-sky-500'
+                        : isDensity ? 'border-cyan-500'
+                        : 'border-fuchsia-500'
                     } ${
                       isSelected ? 'bg-fuchsia-900/30 ring-1 ring-fuchsia-500' : 'bg-[#0f0f1a] hover:bg-[#1a2a4a]'
                     }`}>
@@ -5210,10 +6922,67 @@ function AiPlaygroundTab({ projectId, projectName, reportById, onActiveChanged }
                       <div className="flex-1 min-w-0 cursor-pointer" onClick={() => openExperiment(e.id)}>
                         <div className="text-sm text-white font-semibold truncate flex items-center gap-1.5">
                           {isActive && <span className="text-amber-300" title="Primary semantic clustering">⭐</span>}
-                          {isDomain && <span className="text-sky-300 text-[9px] font-bold bg-sky-950/60 border border-sky-700/60 rounded px-1 py-0.5" title="Business-domain classification experiment">DOMAIN</span>}
+                          {/* Clustering kind badge */}
+                          {isDomain ? (
+                            <span className="text-sky-300 text-[9px] font-bold bg-sky-950/60 border border-sky-700/60 rounded px-1 py-0.5" title="Business-domain classification experiment">🏷 DOMAIN</span>
+                          ) : isDensity ? (
+                            <span className="text-cyan-300 text-[9px] font-bold bg-cyan-950/60 border border-cyan-700/60 rounded px-1 py-0.5" title="UMAP + HDBSCAN density clustering">🔷 DENSITY</span>
+                          ) : (
+                            <span className="text-fuchsia-300 text-[9px] font-bold bg-fuchsia-950/60 border border-fuchsia-700/60 rounded px-1 py-0.5" title="Cosine similarity + union-find clustering">🔀 COSINE</span>
+                          )}
                           <span className="truncate">{e.name}</span>
                         </div>
                         <div className="text-[11px] text-gray-500 font-mono truncate">{e.id}</div>
+                        {/* Embedding source chip — the named set, else fields used inline */}
+                        <div className="text-[10px] mt-0.5 flex flex-wrap items-center gap-1">
+                          {cfgEmbSet ? (
+                            <span className="text-violet-300 bg-violet-950/40 border border-violet-700/50 rounded px-1 py-0.5" title="This experiment used a saved embedding set (0 embedding cost beyond the set itself)">
+                              🎯 embedding: <code className="text-violet-200">{cfgEmbSet}</code>
+                            </span>
+                          ) : (() => {
+                            const cfg = (e.config as {
+                              fields?: Record<string, boolean | number>;
+                              scope?: string;
+                              sourceFilter?: string;
+                              model?: string;
+                              dimensions?: number;
+                            }) || {};
+                            const activeFields = Object.entries(cfg.fields || {})
+                              .filter(([, v]) => v === true)
+                              .map(([k]) => k);
+                            return (
+                              <>
+                                <span
+                                  className="text-violet-300 bg-violet-900/30 border border-violet-700/40 rounded px-1 py-0.5"
+                                  title="Embeddings built inline from these fields. Use the Embeddings tab to save a reusable set."
+                                >
+                                  🎯 inline:{' '}
+                                  <code className="text-violet-200">
+                                    {activeFields.length ? activeFields.join(',') : '(none)'}
+                                  </code>
+                                </span>
+                                {cfg.model && (
+                                  <span
+                                    className="text-gray-500"
+                                    title={`Model ${cfg.model} @ ${cfg.dimensions ?? 'default'} dims`}
+                                  >
+                                    {cfg.model.replace('text-embedding-3-', '').toUpperCase()}
+                                    {cfg.dimensions ? `-${cfg.dimensions}` : ''}
+                                  </span>
+                                )}
+                                {cfg.scope && (
+                                  <span
+                                    className="text-gray-500"
+                                    title={`Scope: ${cfg.scope} · source filter: ${cfg.sourceFilter || 'all'}`}
+                                  >
+                                    · {cfg.scope}
+                                    {cfg.sourceFilter && cfg.sourceFilter !== 'all' ? `/${cfg.sourceFilter}` : ''}
+                                  </span>
+                                )}
+                              </>
+                            );
+                          })()}
+                        </div>
                       </div>
                       <button
                         onClick={(ev) => { ev.stopPropagation(); handleDelete(e.id); }}
@@ -5238,6 +7007,43 @@ function AiPlaygroundTab({ projectId, projectName, reportById, onActiveChanged }
                         <span className="text-amber-300">{e.stats.finalUnique}</span>{' '}
                         <span className="text-gray-500">unique</span>
                       </div>
+                      {(() => {
+                        // "Reviewed" only if the review actually produced
+                        // labels. If llmReviewedAt is set but reviewed=0, the
+                        // run failed (e.g. the model-param bug) — keep the
+                        // button visible for a retry.
+                        const reviewedCount = e.llmReviewSummary?.reviewed ?? 0;
+                        const isReviewed = !!e.llmReviewedAt && reviewedCount > 0;
+                        if (isReviewed) {
+                          return (
+                            <span
+                              className="text-[10px] text-emerald-300 bg-emerald-950/30 border border-emerald-700/50 rounded px-1.5 py-0.5 flex-shrink-0 cursor-pointer hover:text-emerald-100"
+                              onClick={(ev) => { ev.stopPropagation(); handleRunLlmReview(e.id); }}
+                              title={`LLM-reviewed ${new Date(e.llmReviewedAt!).toLocaleString()} — ${reviewedCount} reviewed, ${e.llmReviewSummary?.removable ?? 0} removable. Click to re-run.`}
+                            >
+                              🤖 reviewed
+                              {e.llmReviewSummary && (
+                                <span className="text-emerald-200 ml-1 font-semibold">
+                                  {' '}−{e.llmReviewSummary.removable}
+                                </span>
+                              )}
+                            </span>
+                          );
+                        }
+                        const hadAttempt = !!e.llmReviewedAt;
+                        return (
+                          <button
+                            onClick={(ev) => { ev.stopPropagation(); handleRunLlmReview(e.id); }}
+                            disabled={running}
+                            className={`text-[10px] ${hadAttempt ? 'text-amber-300 hover:text-amber-100 border-amber-700/60 hover:border-amber-500' : 'text-indigo-300 hover:text-indigo-100 border-indigo-700/60 hover:border-indigo-500'} border disabled:opacity-40 disabled:cursor-not-allowed rounded px-1.5 py-0.5 flex-shrink-0`}
+                            title={hadAttempt
+                              ? 'Previous LLM review errored for every cluster — click to retry.'
+                              : 'Run GPT LLM review on every multi-cluster in this experiment (caches per cluster — re-runs are free)'}
+                          >
+                            {hadAttempt ? '🤖 Retry LLM Review' : '🤖 LLM Review'}
+                          </button>
+                        );
+                      })()}
                       {canPromote && (
                         isActive ? (
                           <span
@@ -5250,7 +7056,7 @@ function AiPlaygroundTab({ projectId, projectName, reportById, onActiveChanged }
                           <button
                             onClick={(ev) => { ev.stopPropagation(); handleMakePrimary(e.id); }}
                             className="text-[10px] text-amber-300 hover:text-amber-100 border border-amber-700/50 hover:border-amber-500 rounded px-2 py-0.5 flex-shrink-0"
-                            title="Use this experiment as the primary Semantic Clusters view for this project"
+                            title="Use this experiment as the primary Semantic Clusters view for this project."
                           >
                             Make Primary
                           </button>
@@ -5442,7 +7248,7 @@ function DensityClusteringTab({
 }) {
   const currentShortId = PROJECT_NAME_TO_SHORT[projectName] || '';
 
-  const [form, setForm] = usePersistentState('density.form.v2', {
+  const DENSITY_DEFAULT_FORM = {
     name: 'density-v1',
     scope: 'post-family',
     sourceFilter: 'all',
@@ -5468,8 +7274,12 @@ function DensityClusteringTab({
       normalizeSql: true,
       maxSqlChars: 1500 as number,
     } as Record<string, boolean | number>,
-  });
+  };
+  const [form, setForm] = usePersistentState('density.form.v2', DENSITY_DEFAULT_FORM);
   const patch = (p: Partial<typeof form>) => setForm((f) => ({ ...f, ...p }));
+  const resetForm = () => {
+    setForm({ ...DENSITY_DEFAULT_FORM, fields: { ...DENSITY_DEFAULT_FORM.fields } });
+  };
 
   // Defensive defaults — if a previous version of this tab was persisted
   // without `fields` (or any other new field), fall back to sensible values
@@ -5486,6 +7296,14 @@ function DensityClusteringTab({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   const toggleField = (k: string) => patch({ fields: { ...fields, [k]: !fields[k] } });
+
+  // Phase 2 — saved embedding sets the user can reference. When set, the
+  // form's scope/fields/model/dim are ignored in favor of the set's values.
+  const [embeddingSetName, setEmbeddingSetName] = usePersistentState<string>(
+    'density.embeddingSetName', '',
+  );
+  const [embeddingSets, setEmbeddingSets] = useState<EmbeddingSet[]>([]);
+  const selectedSet = embeddingSets.find((s) => s.name === embeddingSetName) || null;
 
   const [experiments, setExperiments] = useState<PlaygroundExperimentIndexEntry[]>([]);
   const [selectedExpId, setSelectedExpId] = usePersistentState<string | null>('density.selectedExpId', null);
@@ -5523,10 +7341,23 @@ function DensityClusteringTab({
       setActiveExpId(null);
     }
   };
+  const loadEmbeddingSets = async () => {
+    if (!currentShortId) { setEmbeddingSets([]); return; }
+    try {
+      const rows = await fetchEmbeddingSets(currentShortId);
+      setEmbeddingSets(rows);
+      if (embeddingSetName && !rows.find((r) => r.name === embeddingSetName)) {
+        setEmbeddingSetName('');
+      }
+    } catch {
+      setEmbeddingSets([]);
+    }
+  };
 
   useEffect(() => {
     loadList();
     loadActive();
+    loadEmbeddingSets();
     fetchDensityDefaults().then((d) => {
       if (d) patch({
         umapNeighbors: d.umap_n_neighbors,
@@ -5562,6 +7393,7 @@ function DensityClusteringTab({
       if (!t) return;
       setActiveTask(t);
       if (t.status === 'completed') {
+        const isLlmReview = (t as { mode?: string }).mode === 'llm_review';
         appendLog('ok', `✓ Task completed. Loading result…`);
         if (t.expId) {
           const e = await fetchPlaygroundExperiment(t.expId);
@@ -5569,6 +7401,13 @@ function DensityClusteringTab({
           await loadList();
         }
         setActiveTask(null); setActiveTaskId(null); setRunStartedAt(null);
+        // Reset the form after a successful density run so the user can
+        // start a new experiment without inheriting prior config. Skip for
+        // LLM-review tasks — those just annotate an existing experiment.
+        if (!isLlmReview) {
+          resetForm();
+          appendLog('info', `Form reset — ready for a new experiment.`);
+        }
       } else if (t.status === 'failed' || t.status === 'interrupted') {
         appendLog('err', `✗ Task ${t.status}: ${t.error || 'no detail'}`);
         setActiveTask(null); setActiveTaskId(null); setRunStartedAt(null);
@@ -5620,6 +7459,7 @@ function DensityClusteringTab({
         clusterSelection: form.clusterSelection,
         fields,
         ...(form.limit ? { limit: form.limit } : {}),
+        ...(embeddingSetName ? { embeddingSetName } : {}),
       });
       if (task.status === 'failed' || task.status === 'interrupted') {
         appendLog('err', `✗ Task failed at creation: ${task.error || 'no detail'}`);
@@ -5658,8 +7498,30 @@ function DensityClusteringTab({
       setActiveExpId(id);
       onActiveChanged?.();
       appendLog('ok', `✓ "${id}" is now the primary clustering for ${currentShortId}.`);
+      const entry = experiments.find((e) => e.id === id);
+      if (!entry?.llmReviewedAt) {
+        appendLog('info', `Experiment has no LLM reviews yet — starting review now.`);
+        await handleRunLlmReview(id);
+      }
     } catch (e) {
       appendLog('err', `✗ Could not promote: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  async function handleRunLlmReview(id: string) {
+    if (!projectId) return;
+    try {
+      appendLog('info', `POST /playground_api/exp/${id}/llm_review …`);
+      const task = await runExperimentLlmReview(id, projectId);
+      if (task.status === 'failed' || task.status === 'interrupted') {
+        appendLog('err', `✗ LLM review failed at creation: ${task.error || 'no detail'}`);
+        return;
+      }
+      appendLog('ok', `✓ LLM review queued: ${task.id}`);
+      setActiveTask(task);
+      setActiveTaskId(task.id);
+      setRunStartedAt(Date.now());
+    } catch (e) {
+      appendLog('err', `✗ LLM review POST failed: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
   async function handleClearPrimary() {
@@ -5689,12 +7551,42 @@ function DensityClusteringTab({
         <div className="bg-[#16213e] p-5 rounded-lg border border-cyan-900/40">
           <h3 className="text-white font-bold mb-3">Configure Density Run</h3>
           <div className="space-y-3 text-sm">
+            {/* Phase 2: pick a saved embedding set */}
+            <div className="p-2 rounded border border-violet-800/40 bg-violet-950/20">
+              <label className="block text-[10px] uppercase tracking-wider text-violet-300 font-bold mb-1">
+                Embedding source
+              </label>
+              {embeddingSets.length === 0 ? (
+                <div className="text-[11px] text-gray-500">
+                  No saved embedding sets. Create one on the <strong className="text-violet-300">Embeddings</strong> tab
+                  to reuse across Density and Semantic runs.
+                </div>
+              ) : (
+                <>
+                  <select value={embeddingSetName}
+                    onChange={(e) => setEmbeddingSetName(e.target.value)}
+                    className="w-full bg-[#0f0f1a] border border-violet-700/50 rounded px-2 py-1.5 text-white text-sm">
+                    <option value="">Build inline from the fields below</option>
+                    {embeddingSets.map((s) => (
+                      <option key={s.name} value={s.name}>
+                        {s.name} — {s.reportCount.toLocaleString()} reports · {s.model.replace('text-embedding-3-', '3-')}/{s.dim}d
+                      </option>
+                    ))}
+                  </select>
+                  {selectedSet && (
+                    <EmbeddingSetDetails set={selectedSet} trailer="UMAP + HDBSCAN only" />
+                  )}
+                </>
+              )}
+            </div>
+
             <div>
               <label className="block text-xs text-gray-400 uppercase mb-1">Name</label>
               <input value={form.name} onChange={(e) => patch({ name: e.target.value })}
                 className="w-full bg-[#0f0f1a] border border-[#1e2d50] rounded px-3 py-2 text-white text-sm" />
               <div className="text-[10px] text-gray-500 mt-1">ID: <code className="text-cyan-300">{expId}</code></div>
             </div>
+            <div className={selectedSet ? 'opacity-40 pointer-events-none space-y-3' : 'space-y-3'}>
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <label className="block text-xs text-gray-400 uppercase mb-1">Scope</label>
@@ -5778,7 +7670,9 @@ function DensityClusteringTab({
                 })()}
               </div>
             </div>
+            </div>{/* end of `selectedSet` disable-wrapper — embedding fields only */}
 
+            {/* Clustering knobs — always editable, even when a saved embedding is picked */}
             <div className="pt-2 border-t border-[#1e2d50]">
               <div className="text-[10px] uppercase tracking-wider text-cyan-400 font-bold mb-2">UMAP (dimensionality reduction)</div>
               <div className="grid grid-cols-3 gap-2">
@@ -5847,6 +7741,20 @@ function DensityClusteringTab({
                 className="bg-[#0f0f1a] hover:bg-[#1a2a4a] text-gray-300 text-sm font-semibold px-4 py-2 rounded border border-[#1e2d50]">
                 ↻ Refresh
               </button>
+              <button
+                onClick={() => {
+                  if (running) return;
+                  if (window.confirm('Reset the form to defaults? Current values will be cleared.')) {
+                    resetForm();
+                    appendLog('info', 'Form reset to defaults.');
+                  }
+                }}
+                disabled={running}
+                className="bg-[#0f0f1a] hover:bg-[#1a2a4a] disabled:opacity-40 disabled:cursor-not-allowed text-gray-300 text-sm font-semibold px-4 py-2 rounded border border-[#1e2d50]"
+                title="Reset form to defaults — use after a completed run to start a fresh experiment"
+              >
+                🆕 New
+              </button>
             </div>
             {runError && (
               <div className="bg-red-950/40 border border-red-700/50 text-red-200 text-xs p-3 rounded">
@@ -5903,10 +7811,58 @@ function DensityClusteringTab({
                       <div className="flex-1 min-w-0 cursor-pointer" onClick={() => openExperiment(e.id)}>
                         <div className="text-sm text-white font-semibold truncate flex items-center gap-1.5">
                           {isActive && <span className="text-amber-300" title="Primary">⭐</span>}
-                          <span className="text-[9px] font-bold text-cyan-300 bg-cyan-950/60 border border-cyan-700/60 rounded px-1 py-0.5">DENSITY</span>
+                          <span className="text-[9px] font-bold text-cyan-300 bg-cyan-950/60 border border-cyan-700/60 rounded px-1 py-0.5" title="UMAP + HDBSCAN density clustering">🔷 DENSITY</span>
                           <span className="truncate">{e.name}</span>
                         </div>
                         <div className="text-[11px] text-gray-500 font-mono truncate">{e.id}</div>
+                        {/* Embedding source chip — the named set, else fields used inline */}
+                        <div className="text-[10px] mt-0.5 flex flex-wrap items-center gap-1">
+                          {(() => {
+                            const cfg = (e.config as {
+                              embeddingSetName?: string;
+                              fields?: Record<string, boolean | number>;
+                              scope?: string;
+                              sourceFilter?: string;
+                              model?: string;
+                              dimensions?: number;
+                            }) || {};
+                            if (cfg.embeddingSetName) {
+                              return (
+                                <span className="text-violet-300 bg-violet-950/40 border border-violet-700/50 rounded px-1 py-0.5" title="This run used a saved embedding set">
+                                  🎯 embedding: <code className="text-violet-200">{cfg.embeddingSetName}</code>
+                                </span>
+                              );
+                            }
+                            const activeFields = Object.entries(cfg.fields || {})
+                              .filter(([, v]) => v === true)
+                              .map(([k]) => k);
+                            return (
+                              <>
+                                <span
+                                  className="text-violet-300 bg-violet-900/30 border border-violet-700/40 rounded px-1 py-0.5"
+                                  title="Embeddings built inline from these fields. Use the Embeddings tab to save a reusable set."
+                                >
+                                  🎯 inline:{' '}
+                                  <code className="text-violet-200">
+                                    {activeFields.length ? activeFields.join(',') : '(none)'}
+                                  </code>
+                                </span>
+                                {cfg.model && (
+                                  <span className="text-gray-500" title={`Model ${cfg.model} @ ${cfg.dimensions ?? 'default'} dims`}>
+                                    {cfg.model.replace('text-embedding-3-', '').toUpperCase()}
+                                    {cfg.dimensions ? `-${cfg.dimensions}` : ''}
+                                  </span>
+                                )}
+                                {cfg.scope && (
+                                  <span className="text-gray-500" title={`Scope: ${cfg.scope} · source filter: ${cfg.sourceFilter || 'all'}`}>
+                                    · {cfg.scope}
+                                    {cfg.sourceFilter && cfg.sourceFilter !== 'all' ? `/${cfg.sourceFilter}` : ''}
+                                  </span>
+                                )}
+                              </>
+                            );
+                          })()}
+                        </div>
                       </div>
                       <button onClick={(ev) => { ev.stopPropagation(); handleDelete(e.id); }}
                         className="text-xs text-red-400 hover:text-red-300 flex-shrink-0">✕</button>
@@ -5929,11 +7885,31 @@ function DensityClusteringTab({
                           <span className="text-gray-500">avg {s.avgClusterSize}/cluster</span>
                         )}
                       </div>
+                      {e.llmReviewedAt ? (
+                        <span
+                          className="text-[10px] text-emerald-300 bg-emerald-950/30 border border-emerald-700/50 rounded px-1.5 py-0.5 flex-shrink-0"
+                          title={`LLM-reviewed ${new Date(e.llmReviewedAt).toLocaleString()}${e.llmReviewSummary ? ` — ${e.llmReviewSummary.reviewed} reviewed, ${e.llmReviewSummary.removable} removable` : ''}`}
+                        >
+                          🤖 reviewed
+                          {e.llmReviewSummary && (
+                            <span className="text-emerald-200 ml-1 font-semibold">
+                              {' '}−{e.llmReviewSummary.removable}
+                            </span>
+                          )}
+                        </span>
+                      ) : (
+                        <button onClick={(ev) => { ev.stopPropagation(); handleRunLlmReview(e.id); }}
+                          className="text-[10px] text-indigo-300 hover:text-indigo-100 border border-indigo-700/60 hover:border-indigo-500 rounded px-1.5 py-0.5 flex-shrink-0"
+                          title="Run GPT LLM review on every multi-cluster in this experiment">
+                          🤖 LLM Review
+                        </button>
+                      )}
                       {isActive ? (
                         <span className="text-[10px] font-bold text-amber-300 bg-amber-950/40 border border-amber-700/60 rounded px-2 py-0.5 flex-shrink-0">PRIMARY</span>
                       ) : (
                         <button onClick={(ev) => { ev.stopPropagation(); handleMakePrimary(e.id); }}
-                          className="text-[10px] text-amber-300 hover:text-amber-100 border border-amber-700/50 hover:border-amber-500 rounded px-2 py-0.5 flex-shrink-0">
+                          className="text-[10px] text-amber-300 hover:text-amber-100 border border-amber-700/50 hover:border-amber-500 rounded px-2 py-0.5 flex-shrink-0"
+                          title="Use this as primary.">
                           Make Primary
                         </button>
                       )}
@@ -6624,7 +8600,12 @@ function ClusterModal({
                       </div>
                     </td>
                     <td className={`p-2 ${isPrimary ? 'text-amber-100 font-semibold' : 'text-white'}`}>{r.name}</td>
-                    <td className="p-2"><SourceTypePill sourceType={r.sourceType} /></td>
+                    <td className="p-2">
+                      <div className="flex items-center gap-1 flex-wrap">
+                        <SourceProjectPill sourceProjectId={r.sourceProjectId} />
+                        <SourceTypePill sourceType={r.sourceType} />
+                      </div>
+                    </td>
                     <td className="p-2 text-center">
                       {hasSql ? (
                         <span
@@ -7903,6 +9884,7 @@ function LlmReviewTab({
   setActionFilter,
   summary,
   semanticClusters,
+  reportById,
   onOpen,
 }: {
   reviews: LlmReview[];
@@ -7913,177 +9895,83 @@ function LlmReviewTab({
   setActionFilter: (v: string) => void;
   summary: RationalizationSummary | null;
   semanticClusters: SemanticCluster[];
+  reportById: Map<string, ReportDetail>;
   onOpen: (r: LlmReview) => void;
 }) {
   const byAction = summary?.llmReviewsByAction || {};
-  const afterSim = summary?.afterSimilarity ?? 0;
   const safeClusters = summary?.llmSafeClusters ?? 0;
   const totalClusters = summary?.llmReviewsTotal ?? 0;
+  const totalRemovable = summary?.llmRemovableRaw ?? 0;
 
-  // Semantic-path stats for the lineage banner
-  const semMulti = semanticClusters.filter((c) => !c.isSingletons);
-  const semReviewed = semMulti.filter((c) => c.llm && !c.llm.error).length;
-  const semRemovable = semMulti.reduce((s, c) => s + ((c.llm?.removableCount) || 0), 0);
+  // Cluster lookup so each review can show its member reports. Uses
+  // semanticClusters since that's what the LLM reviews were run on. Key by
+  // both numeric form (42) and padded form (C0042 / XC0042) to tolerate
+  // different id shapes across experiment types.
+  const clusterById = useMemo(() => {
+    const m = new Map<string, SemanticCluster>();
+    for (const c of semanticClusters) {
+      if (c.isSingletons) continue;
+      m.set(c.id, c);
+    }
+    return m;
+  }, [semanticClusters]);
+
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const toggleExpanded = (cid: string) => {
+    setExpanded((s) => {
+      const next = new Set(s);
+      if (next.has(cid)) next.delete(cid); else next.add(cid);
+      return next;
+    });
+  };
 
   return (
-    <div className="space-y-4">
-      {/* Pipeline lineage banner — LLM Review sits on top of BOTH clustering branches */}
+    <div className="space-y-3">
+      {/* Compact single-line lineage + LLM summary */}
       {summary && (
-        <div className="bg-gradient-to-r from-indigo-950/60 to-[#16213e] p-4 rounded-lg border border-indigo-800/40">
-          <div className="text-xs uppercase tracking-wider text-indigo-300 font-bold mb-2">
-            Pipeline Lineage — LLM Review Sits Above the Clustering Layer
-          </div>
-          <div className="flex items-center gap-2 text-sm flex-wrap">
-            <span className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]">
-              <span className="text-gray-400">Inventory:</span>{' '}
-              <span className="font-bold text-white">{summary.totalInventory.toLocaleString()}</span>
+        <div className="bg-gradient-to-r from-indigo-950/40 to-[#16213e] px-3 py-2 rounded border border-indigo-800/40">
+          <div className="flex items-center gap-2 text-xs flex-wrap">
+            <span className="text-[10px] uppercase tracking-wider text-indigo-300 font-bold mr-1">Lineage</span>
+            <span className="text-gray-400">{summary.totalInventory.toLocaleString()}</span>
+            <span className="text-gray-600">→</span>
+            <span className="text-gray-400" title="After telemetry retirement">{summary.afterTelemetry?.toLocaleString()}</span>
+            <span className="text-gray-600">→</span>
+            <span className="text-gray-400" title="After fingerprint dedup">{summary.afterFingerprint?.toLocaleString()}</span>
+            <span className="text-gray-600">→</span>
+            <span className="text-gray-400" title="After AST dedup">{summary.afterAst?.toLocaleString()}</span>
+            <span className="text-gray-600">→</span>
+            <span className="text-orange-300" title="Post-family — feeds clustering">{(summary.afterPostAstFamily ?? summary.afterFamily)?.toLocaleString()}</span>
+            <span className="text-gray-600">→</span>
+            <span className="text-teal-300" title="Multi-clusters formed">{semanticClusters.filter((c) => !c.isSingletons).length.toLocaleString()} clusters</span>
+            <span className="text-gray-600">→</span>
+            <span className="px-1.5 py-0.5 bg-indigo-900/60 rounded text-indigo-100 font-semibold" title="Clusters GPT has labeled">
+              {totalClusters.toLocaleString()} reviewed
             </span>
-            <span className="text-gray-500">{'\u2192'}</span>
-            <span className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]">
-              <span className="text-gray-400">After telemetry:</span>{' '}
-              <span className="font-bold text-white">{summary.afterTelemetry.toLocaleString()}</span>
-            </span>
-            {summary.afterCollisionCollapse !== undefined && (
-              <>
-                <span className="text-gray-500">{'\u2192'}</span>
-                <span className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]">
-                  <span className="text-gray-400">Collision:</span>{' '}
-                  <span className="font-bold text-white">{summary.afterCollisionCollapse.toLocaleString()}</span>
-                </span>
-              </>
+            {safeClusters > 0 && (
+              <span className="px-1.5 py-0.5 bg-green-900/40 rounded text-green-200" title="Clusters actionable without human intervention">
+                {safeClusters.toLocaleString()} safe-to-auto
+              </span>
             )}
-            <span className="text-gray-500">{'\u2192'}</span>
-            <span className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]">
-              <span className="text-gray-400">Fingerprint:</span>{' '}
-              <span className="font-bold text-white">{summary.afterFingerprint?.toLocaleString() ?? '-'}</span>
-            </span>
-            {summary.afterSqlHash !== undefined && (
-              <>
-                <span className="text-gray-500">{'\u2192'}</span>
-                <span className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]">
-                  <span className="text-blue-300">SQL Hash:</span>{' '}
-                  <span className="font-bold text-white">{summary.afterSqlHash.toLocaleString()}</span>
-                </span>
-              </>
-            )}
-            {summary.afterAst !== undefined && (
-              <>
-                <span className="text-gray-500">{'\u2192'}</span>
-                <span className="px-3 py-1.5 bg-[#0f0f1a] rounded border border-[#2a2a4a]">
-                  <span className="text-pink-300">After AST:</span>{' '}
-                  <span className="font-bold text-white">{summary.afterAst.toLocaleString()}</span>
-                </span>
-              </>
-            )}
-            {summary.afterPostAstFamily !== undefined && (
-              <>
-                <span className="text-gray-500">{'\u2192'}</span>
-                <span
-                  className="px-3 py-1.5 bg-orange-900/20 rounded border border-orange-700/50"
-                  title="Post-AST Family collapse — name-sibling canonicals merged. Input to both clustering branches."
-                >
-                  <span className="text-orange-300">After Family (clustering input):</span>{' '}
-                  <span className="font-bold text-white">{summary.afterPostAstFamily.toLocaleString()}</span>
-                  {summary.postAstFamilyCollapsed !== undefined && summary.postAstFamilyCollapsed > 0 && (
-                    <span className="text-green-400 text-xs ml-1">({'\u2212'}{summary.postAstFamilyCollapsed.toLocaleString()})</span>
-                  )}
-                </span>
-              </>
+            {totalRemovable > 0 && (
+              <span className="px-1.5 py-0.5 bg-red-900/30 rounded text-red-200" title="Total reports flagged as removable across all reviews">
+                −{totalRemovable.toLocaleString()} removable
+              </span>
             )}
           </div>
-
-          {/* Two-branch visualization */}
-          <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3">
-            {/* Primary path — Semantic + its own LLM */}
-            <div className="p-3 rounded border border-teal-700/50 bg-teal-950/30">
-              <div className="text-[10px] uppercase tracking-wider text-teal-300 font-bold mb-2">
-                Primary path — Semantic clustering + inline LLM
-              </div>
-              <div className="flex items-center gap-2 text-xs flex-wrap">
-                <span className="text-gray-500">post-AST-family</span>
-                <span className="font-mono text-gray-500">{'\u2192'}</span>
-                <span className="px-2 py-1 bg-[#0f0f1a] rounded border border-teal-700/50">
-                  <span className="text-teal-300">Semantic clusters:</span>{' '}
-                  <span className="text-white font-semibold">{semMulti.length.toLocaleString()}</span>
-                </span>
-                <span className="font-mono text-gray-500">{'\u2192'}</span>
-                <span className="px-2 py-1 bg-[#0f0f1a] rounded border border-teal-700/50">
-                  <span className="text-teal-300">LLM reviewed:</span>{' '}
-                  <span className="text-white font-semibold">{semReviewed.toLocaleString()}</span>
-                </span>
-                {semRemovable > 0 && (
-                  <span className="px-2 py-1 bg-green-900/40 rounded border border-green-700/60 text-green-200">
-                    LLM-removable: <span className="font-semibold text-white">−{semRemovable.toLocaleString()}</span>
-                  </span>
-                )}
-              </div>
-              <div className="text-[10px] text-gray-500 mt-1">
-                Reviews live on the <strong className="text-gray-400">Semantic Clusters</strong> tab
-                (inline per-cluster badge + drill-down).
-              </div>
-            </div>
-
-            {/* Alternative path — Similarity + this LLM Review tab (highlighted) */}
-            <div className="p-3 rounded border border-indigo-600 bg-indigo-900/30 ring-2 ring-indigo-500/40">
-              <div className="text-[10px] uppercase tracking-wider text-indigo-300 font-bold mb-2">
-                Alternative path — Similarity clustering + THIS tab
-              </div>
-              <div className="flex items-center gap-2 text-xs flex-wrap">
-                <span className="text-gray-500">post-AST-family</span>
-                <span className="font-mono text-gray-500">{'\u2192'}</span>
-                <span className="px-2 py-1 bg-[#0f0f1a] rounded border border-indigo-700/60">
-                  <span className="text-indigo-300">After Similarity:</span>{' '}
-                  <span className="text-white font-semibold">{afterSim.toLocaleString()}</span>
-                </span>
-                <span className="font-mono text-gray-500">{'\u2192'}</span>
-                <span className="px-2 py-1 bg-indigo-900/60 rounded border border-indigo-600 ring-1 ring-indigo-500/40">
-                  <span className="text-indigo-200">LLM reviewed:</span>{' '}
-                  <span className="text-white font-semibold">{totalClusters.toLocaleString()}</span>
-                </span>
-                {safeClusters > 0 && (
-                  <span className="px-2 py-1 bg-green-900/40 rounded border border-green-700/60 text-green-200">
-                    Safe-to-auto: <span className="font-semibold text-white">{safeClusters.toLocaleString()}</span>
-                  </span>
-                )}
-              </div>
-              <div className="text-[10px] text-gray-500 mt-1">
-                Reviews shown below. Lexical weighted-Jaccard ≥ 0.80; doesn't catch synonym variants.
-              </div>
-            </div>
-          </div>
-
-          <p className="text-xs text-gray-500 mt-3 leading-relaxed">
-            Both branches read the same <strong className="text-gray-400">{(summary.afterPostAstFamily ?? summary.afterAst)?.toLocaleString() ?? '?'}</strong> post-family canonicals
-            and each runs its own LLM classification. <strong className="text-teal-300">Semantic</strong> (top) is the primary
-            path — it catches terminology variants lexical Jaccard misses.
-            <strong className="text-indigo-300"> Similarity</strong> (this tab) is retained as a
-            high-precision alternative for pairs with heavy metric/table overlap.
-          </p>
         </div>
       )}
-
-    <div className="bg-[#16213e] p-6 rounded-lg">
-      <div className="flex justify-between items-start mb-4">
-        <div>
-          <h2 className="text-lg font-bold text-white">
-            LLM Review <span className="text-sm text-gray-400 font-normal">({reviews.length} shown of {totalCount})</span>
-          </h2>
-          <p className="text-xs text-gray-400 mt-1">
-            GPT classification of the {totalClusters} multi-report similarity clusters {'\u2014'} recommends what action to take per cluster (merge now, parameterize, review with owner, or keep separate).
-          </p>
-        </div>
-        <div className="bg-[#0f0f1a] rounded-lg px-4 py-3 text-xs">
-          <div className="text-gray-400 mb-1">Context</div>
-          <div className="text-white font-mono">
-            After Similarity: <span className="text-green-400 font-bold">{afterSim.toLocaleString()}</span> canonical units
-          </div>
-          <div className="text-gray-500 mt-1">
-            {safeClusters} cluster{safeClusters === 1 ? '' : 's'} flagged safe to auto-consolidate (HIGH confidence)
-          </div>
-        </div>
-      </div>
-
-      <div className="grid grid-cols-4 gap-3 mb-4">
+      {/* Filter pills (one row, replaces the 4 tall tiles) */}
+      <div className="flex items-center gap-2 flex-wrap text-xs">
+        <button
+          onClick={() => setActionFilter('all')}
+          className={`px-2.5 py-1 rounded border transition-colors ${
+            actionFilter === 'all'
+              ? 'bg-[#1a2a4a] border-blue-500 text-white ring-1 ring-blue-500/50'
+              : 'bg-[#0f0f1a] border-[#1e2d50] text-gray-300 hover:bg-[#1a2a4a]'
+          }`}
+        >
+          All <span className="text-gray-500 ml-1">{totalCount}</span>
+        </button>
         {Object.entries(LLM_ACTION_STYLES).map(([key, s]) => {
           const count = byAction[key] || 0;
           const selected = actionFilter === key;
@@ -8091,70 +9979,172 @@ function LlmReviewTab({
             <button
               key={key}
               onClick={() => setActionFilter(selected ? 'all' : key)}
-              className={`text-left p-3 rounded-lg border-l-4 ${s.border} ${selected ? 'bg-[#1a2a4a] ring-1 ring-blue-500' : 'bg-[#0f0f1a] hover:bg-[#1a2a4a]'} transition-colors`}
+              className={`px-2.5 py-1 rounded border transition-colors ${
+                selected
+                  ? `${s.bg} text-white border-transparent ring-1 ring-white/30`
+                  : `bg-[#0f0f1a] ${s.border} text-gray-300 hover:bg-[#1a2a4a]`
+              }`}
             >
-              <div className="text-[10px] text-gray-400 uppercase tracking-wider">{s.label}</div>
-              <div className="text-2xl font-bold text-white mt-1">{count}</div>
-              <div className="text-[10px] text-gray-500 mt-0.5">clusters</div>
+              {s.label} <span className={`${selected ? 'text-white/90' : 'text-gray-500'} ml-1`}>{count}</span>
             </button>
           );
         })}
-      </div>
-
-      <div className="flex gap-2 mb-4 items-center">
-        <div className="flex-1 relative">
-          <VscSearch className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" />
+        <div className="flex-1 min-w-[220px] relative ml-auto">
+          <VscSearch className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-500 text-xs" />
           <input
             type="text"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search by label, primary name, keep_report, business function..."
-            className="w-full bg-[#0f0f1a] border border-[#1e2d50] rounded-lg pl-10 pr-4 py-3 text-white text-sm focus:outline-none focus:border-blue-500"
+            placeholder="Search label, primary, keep_report, business…"
+            className="w-full bg-[#0f0f1a] border border-[#1e2d50] rounded pl-7 pr-3 py-1.5 text-white text-xs focus:outline-none focus:border-blue-500"
           />
         </div>
-        {actionFilter !== 'all' && (
-          <button
-            onClick={() => setActionFilter('all')}
-            className="text-xs text-gray-400 hover:text-white px-3 py-2 bg-[#0f0f1a] rounded border border-[#1e2d50]"
-          >
-            Clear filter
-          </button>
-        )}
       </div>
 
-      <div className="space-y-2 max-h-[70vh] overflow-y-auto pr-2">
+      {/* Review list — click a row to expand in place and see every report GPT looked at */}
+      <div className="space-y-1.5 max-h-[75vh] overflow-y-auto pr-1">
         {reviews.map((r) => {
           const s = actionStyle(r.consolidation_action);
+          const isOpen = expanded.has(r.clusterId);
+          const cluster = clusterById.get(r.clusterId);
+          const memberIds = cluster?.memberIds ?? [];
+          const keepId = cluster?.primaryReportId;
+          const members = memberIds
+            .map((mid) => reportById.get(mid))
+            .filter((x): x is ReportDetail => !!x)
+            .sort((a, b) => {
+              if (a.id === keepId) return -1;
+              if (b.id === keepId) return 1;
+              return (b.executions || 0) - (a.executions || 0);
+            });
           return (
             <div
               key={r.clusterId}
-              onClick={() => onOpen(r)}
-              className={`bg-[#0f0f1a] p-4 rounded-lg cursor-pointer hover:bg-[#1a2a4a] transition-colors border-l-4 ${s.border}`}
+              className={`bg-[#0f0f1a] rounded border-l-2 ${s.border} text-sm`}
             >
-              <div className="flex justify-between items-start gap-3">
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2 mb-1">
-                    <span className="text-xs text-gray-500 font-mono">{r.clusterId}</span>
-                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${s.bg} text-white`}>{s.label}</span>
-                    <span className={`text-[10px] font-semibold px-2 py-0.5 rounded ${confidenceStyle(r.confidence)}`}>{r.confidence}</span>
-                    <span className="text-[10px] text-gray-500 px-2 py-0.5 rounded bg-gray-800">{r.relationship}</span>
-                  </div>
-                  <div className="text-white font-semibold text-sm truncate">{r.label}</div>
-                  <div className="text-xs text-gray-400 mt-1 line-clamp-2">{r.business_function}</div>
-                </div>
-                <div className="flex flex-col items-end gap-1 flex-shrink-0">
-                  <div className="bg-blue-600 text-white text-xs font-bold px-3 py-1 rounded-full whitespace-nowrap">
-                    {r.clusterSize} reports
-                  </div>
-                  <div className="text-xs text-red-400 font-bold whitespace-nowrap">
-                    {'\u2212'}{r.removable_count} removable
-                  </div>
-                  <VscChevronRight className="text-gray-500" />
-                </div>
+              <div
+                className="p-2.5 cursor-pointer hover:bg-[#1a2a4a] flex items-center gap-2"
+                onClick={() => toggleExpanded(r.clusterId)}
+              >
+                <span className="text-gray-500 text-xs w-3">{isOpen ? '▾' : '▸'}</span>
+                <span className="font-mono text-xs text-gray-500 w-16 flex-shrink-0">{r.clusterId}</span>
+                <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${s.bg} text-white flex-shrink-0`}>
+                  {s.label}
+                </span>
+                <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${confidenceStyle(r.confidence)} flex-shrink-0`}>
+                  {r.confidence}
+                </span>
+                <span className="text-white text-sm truncate flex-1" title={r.business_function}>
+                  {r.label || <span className="italic text-gray-500">(no label)</span>}
+                </span>
+                <span className="text-xs text-gray-400 whitespace-nowrap flex-shrink-0">
+                  {r.clusterSize} reports
+                </span>
+                {r.removable_count > 0 && (
+                  <span className="text-xs text-red-300 font-semibold whitespace-nowrap flex-shrink-0">
+                    {'−'}{r.removable_count}
+                  </span>
+                )}
               </div>
-              {r.keep_report && (
-                <div className="mt-2 text-[11px] text-gray-500">
-                  Keep: <span className="text-green-400 font-mono">{r.keep_report}</span>
+
+              {isOpen && (
+                <div className="px-3 pb-3 border-t border-[#1e2d50]">
+                  <div className="mt-2 grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+                    <div className="md:col-span-2">
+                      <div className="text-[10px] uppercase text-gray-500 mb-0.5">Business function</div>
+                      <div className="text-gray-200">{r.business_function || <span className="italic text-gray-600">{'—'}</span>}</div>
+                    </div>
+                    <div>
+                      <div className="text-[10px] uppercase text-gray-500 mb-0.5">Relationship</div>
+                      <div className="text-gray-200">{r.relationship || '—'}</div>
+                    </div>
+                  </div>
+                  {r.consolidation_detail && (
+                    <div className="mt-2 text-xs">
+                      <div className="text-[10px] uppercase text-gray-500 mb-0.5">GPT recommendation</div>
+                      <div className="text-gray-300 leading-snug">{r.consolidation_detail}</div>
+                    </div>
+                  )}
+
+                  <div className="mt-3 flex items-center justify-between">
+                    <div className="text-[10px] uppercase text-gray-500">
+                      Reports GPT reviewed{' '}
+                      <span className="text-gray-400 normal-case">
+                        ({members.length} shown{memberIds.length > members.length ? ` · ${memberIds.length - members.length} not in current project view` : ''})
+                      </span>
+                    </div>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); onOpen(r); }}
+                      className="text-[10px] text-blue-300 hover:text-blue-100 border border-blue-800/60 rounded px-2 py-0.5"
+                      title="Open full drill-down modal"
+                    >
+                      Open modal {'→'}
+                    </button>
+                  </div>
+
+                  {members.length > 0 ? (
+                    <div className="mt-1.5 bg-[#0a0a14] border border-[#1e2d50] rounded overflow-hidden">
+                      <table className="w-full text-xs">
+                        <thead className="bg-[#0f0f1a] text-[10px] uppercase text-gray-500">
+                          <tr>
+                            <th className="text-left px-2 py-1 w-24">Role</th>
+                            <th className="text-left px-2 py-1">Report</th>
+                            <th className="text-left px-2 py-1 w-16">Source</th>
+                            <th className="text-right px-2 py-1 w-20">Execs</th>
+                            <th className="text-right px-2 py-1 w-14">Users</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {members.slice(0, 50).map((m) => {
+                            const isKeep = m.id === keepId || m.name === r.keep_report;
+                            return (
+                              <tr
+                                key={m.id}
+                                className={`border-t border-[#1e2d50] ${isKeep ? 'bg-amber-950/20' : ''}`}
+                              >
+                                <td className="px-2 py-1">
+                                  {isKeep ? (
+                                    <span className="text-[10px] font-bold text-amber-300 bg-amber-950/50 border border-amber-700/60 rounded px-1.5 py-0.5 whitespace-nowrap">
+                                      {'⭐'} KEEP
+                                    </span>
+                                  ) : (
+                                    <span className="text-[10px] text-red-400 bg-red-950/30 border border-red-800/50 rounded px-1.5 py-0.5 whitespace-nowrap">
+                                      {'❌'} remove
+                                    </span>
+                                  )}
+                                </td>
+                                <td className="px-2 py-1">
+                                  <div className={`truncate ${isKeep ? 'text-amber-100 font-semibold' : 'text-gray-200'}`} title={m.id}>
+                                    {m.name}
+                                  </div>
+                                  {m.path && (
+                                    <div className="text-[10px] text-gray-600 truncate">{m.path}</div>
+                                  )}
+                                </td>
+                                <td className="px-2 py-1"><SourceTypePill sourceType={m.sourceType} /></td>
+                                <td className={`px-2 py-1 text-right font-mono ${isKeep ? 'text-amber-200' : 'text-gray-400'}`}>
+                                  {(m.executions ?? 0).toLocaleString()}
+                                </td>
+                                <td className="px-2 py-1 text-right font-mono text-gray-500">
+                                  {m.users ?? 0}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                      {members.length > 50 && (
+                        <div className="text-[10px] text-gray-500 text-center py-1 border-t border-[#1e2d50]">
+                          Showing first 50 of {members.length} members.
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="mt-1.5 text-[11px] text-amber-400 italic">
+                      Member reports aren't in the current project's reports.json view (e.g., retired or filtered out).
+                      Open the full drill-down modal to see them anyway.
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -8166,7 +10156,6 @@ function LlmReviewTab({
           </div>
         )}
       </div>
-    </div>
     </div>
   );
 }

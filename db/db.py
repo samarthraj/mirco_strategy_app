@@ -78,6 +78,22 @@ PROJECTS = [
         "retired_batches": ["retire"],
         "dossier_batches": [],
     },
+    # Virtual project: union of isFinalCanonical=true reports from GO, GI,
+    # and INSIGHT. Populated by `db/compute/combined_reports.py` on demand,
+    # not by direct raw-inventory ingest. Lets the user re-run the full
+    # Rationalization pipeline against the cross-project keep-set — so
+    # cross-project duplicates surface as clusters.
+    {
+        "project_id": "combined-reports",
+        "name": "Combined Reports Project",
+        "mstr_project_id": "",
+        "data_dir": REPO_ROOT / "public" / "data" / "Combined Reports Project",
+        "reports_scope": "active",
+        "active_batches": ["combined"],
+        "retired_batches": [],
+        "dossier_batches": [],
+        "is_virtual": True,
+    },
 ]
 
 

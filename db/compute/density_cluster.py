@@ -57,6 +57,12 @@ def run_density_clustering(config: dict, verbose: bool = True) -> dict:
     import hdbscan
     from sklearn.metrics import silhouette_score
 
+    # Phase 2: if the user picked a saved embedding set, resolve its
+    # scope/sourceFilter/model/dim/fields into the config so this run
+    # reuses the cached vectors.
+    from db.compute.embedding_set import resolve_config_from_set
+    config = resolve_config_from_set(config)
+
     exp_id = config.get("id") or f"density-{int(time.time())}"
     name = config.get("name") or exp_id
     project_id = _resolve_project_id(config["project"])

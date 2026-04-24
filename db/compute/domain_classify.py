@@ -65,7 +65,12 @@ DEFAULT_DOMAINS: list[str] = [
 ]
 
 CLASSIFY_MODEL = "gpt-5.4"
-BATCH_SIZE = 25
+BATCH_SIZE = 50           # larger batches = fewer API calls; 50 is the sweet
+                          # spot — GPT reliably keeps alignment at this size,
+                          # 100 starts missing items.
+MAX_CONCURRENT = 4        # parallel batches in-flight. 4 x 50 = 200 reports
+                          # processed concurrently — ~8x faster than the old
+                          # serial BATCH_SIZE=25 path for big projects.
 
 
 _SCHEMA_SQL = """
@@ -178,7 +183,9 @@ def _classify_batch(client, model: str, taxonomy: list[str],
             {"role": "user", "content": user},
         ],
         response_format={"type": "json_object"},
-        max_completion_tokens=4000,
+        # Each result row is ~60 tokens (id + domain + confidence in JSON).
+        # 50 reports x 60 ~= 3000, +buffer for large-id fields -> 8000.
+        max_completion_tokens=8000,
         temperature=0.1,
     )
     raw = resp.choices[0].message.content or "{}"
@@ -274,28 +281,58 @@ def run_domain_classification(config: dict, verbose: bool = True) -> dict:
             print(f"[classify] cache hits: {len(results):,}   new: {len(to_classify):,}")
 
         if to_classify:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
             client = _openai_client()
+            batches: list[list[str]] = [
+                to_classify[i:i + BATCH_SIZE]
+                for i in range(0, len(to_classify), BATCH_SIZE)
+            ]
+            # SQLite connections are thread-bound by default; keep DB writes
+            # on the main thread (this thread) and only parallelize the
+            # OpenAI calls which is the actual slow part (~5-15s per batch).
+            # Workers return rows; main thread writes them as they complete.
             done = 0
-            for i in range(0, len(to_classify), BATCH_SIZE):
-                batch_rids = to_classify[i:i + BATCH_SIZE]
+            now_utc = datetime.now(timezone.utc).isoformat
+
+            def _process_batch(
+                batch_rids: list[str],
+            ) -> tuple[list[tuple], dict[str, tuple[str, float]]]:
                 items = [(rid, text_by_rid[rid]) for rid in batch_rids]
-                batch_out = _classify_batch(client, model, taxonomy, items, verbose)
-                now = datetime.now(timezone.utc).isoformat()
-                rows = []
-                for rid, (dom, conf) in batch_out.items():
-                    results[rid] = (dom, conf)
-                    rows.append((project_id, rid, hash_by_rid[rid], dom, conf, now))
-                with conn:
-                    conn.executemany(
-                        """INSERT OR REPLACE INTO report_domain
-                            (project_id, report_id, content_hash, domain,
-                             confidence, classified_at)
-                           VALUES (?, ?, ?, ?, ?, ?)""",
-                        rows,
-                    )
-                done += len(batch_rids)
-                if verbose:
-                    print(f"[classify] progress: {done}/{len(to_classify)}")
+                batch_out = _classify_batch(client, model, taxonomy, items, verbose=False)
+                ts = now_utc()
+                rows = [
+                    (project_id, rid, hash_by_rid[rid], dom, conf, ts)
+                    for rid, (dom, conf) in batch_out.items()
+                ]
+                return rows, batch_out
+
+            if verbose:
+                print(f"[classify] {len(batches)} batches of <={BATCH_SIZE} "
+                      f"with {MAX_CONCURRENT} workers")
+            with ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as pool:
+                futures = [pool.submit(_process_batch, b) for b in batches]
+                for fut in as_completed(futures):
+                    try:
+                        rows, batch_out = fut.result()
+                    except Exception as e:
+                        if verbose:
+                            print(f"[classify] batch failed: {e}")
+                        continue
+                    # Main-thread DB write — no cross-thread connection use.
+                    for rid, (dom, conf) in batch_out.items():
+                        results[rid] = (dom, conf)
+                    with conn:
+                        conn.executemany(
+                            """INSERT OR REPLACE INTO report_domain
+                                (project_id, report_id, content_hash, domain,
+                                 confidence, classified_at)
+                               VALUES (?, ?, ?, ?, ?, ?)""",
+                            rows,
+                        )
+                    done += len(rows)
+                    if verbose:
+                        print(f"[classify] progress: {done}/{len(to_classify)}")
 
         # Group reports by domain -> clusters
         by_domain: dict[str, list[str]] = {d: [] for d in taxonomy}

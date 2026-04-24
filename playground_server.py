@@ -48,6 +48,12 @@ from db.compute.domain_classify import (
 from db.compute.density_cluster import (
     run_density_clustering, DEFAULTS as DENSITY_DEFAULTS,
 )
+from db.compute.experiment_llm_review import run_experiment_llm_review
+from db.compute.embedding_set import (
+    run_embedding_set, preview_embedding_set,
+    list_embedding_sets, delete_embedding_set,
+)
+from db.compute.combined_reports import build_combined_reports, combined_status
 
 
 app = FastAPI(title="AI Playground Sidecar")
@@ -159,6 +165,10 @@ class PlaygroundConfig(BaseModel):
     minClusterSize: int = 2
     fields: dict[str, Any] = {}
     limit: int | None = None
+    # Phase 2: when set, the compute runner loads this set's
+    # scope/sourceFilter/model/dim/fields and overrides the caller's
+    # values so cached vectors are reused.
+    embeddingSetName: str | None = None
 
 
 @app.get("/playground_api/health")
@@ -219,6 +229,129 @@ def run(config: PlaygroundConfig) -> dict:
     return dict(task)
 
 
+# ============================================================
+# Named embedding sets — the asset layer that clustering methods build on.
+# Creating an embedding set runs the embed step once against the cache; the
+# resulting set can then be referenced by name from any clustering method.
+# ============================================================
+
+class EmbeddingSetConfig(BaseModel):
+    name: str
+    project: str
+    scope: str = "post-family"
+    sourceFilter: str = "all"
+    # Optional: restrict to a single business domain from report_domain.
+    # "all"/None = no filter. Other values must be a domain name verbatim
+    # (e.g. "Sales - Retail"). Requires the project to have run Classify
+    # Domain first, otherwise the scope comes back empty.
+    domainFilter: str | None = None
+    model: str = "text-embedding-3-large"
+    dimensions: int = 3072
+    fields: dict[str, Any] = {}
+    limit: int | None = None
+
+
+@app.get("/playground_api/embeddings")
+def list_embeddings(project: str | None = None) -> list[dict]:
+    return list_embedding_sets(project)
+
+
+@app.post("/playground_api/embeddings/preview")
+def preview_embedding(config: EmbeddingSetConfig) -> dict:
+    """Cost preview — no OpenAI calls. Reports how many reports are in
+    scope, how many are already cached, and the estimated USD cost."""
+    return preview_embedding_set(config.model_dump())
+
+
+@app.post("/playground_api/embeddings/run")
+def run_embedding(config: EmbeddingSetConfig) -> dict:
+    """Create (or refresh) a named embedding set. Async task — poll
+    /playground_api/task/{id}."""
+    if not os.environ.get("OPENAI_API_KEY"):
+        raise HTTPException(
+            status_code=500,
+            detail="OPENAI_API_KEY not set on the server. Add it to .env.local.",
+        )
+    cfg = config.model_dump()
+    task_id = f"task-{uuid.uuid4().hex[:12]}"
+    task = {
+        "id": task_id,
+        "status": "running",
+        "name": f"Embedding set · {cfg['name']}",
+        "expId": None,
+        "config": cfg,
+        "mode": "embedding_set",
+        "startedAt": datetime.now(timezone.utc).isoformat(),
+        "endedAt": None,
+        "error": None,
+    }
+    with _TASKS_LOCK:
+        _TASKS[task_id] = task
+        _save_tasks()
+    t = threading.Thread(
+        target=_run_in_background,
+        args=(task_id, cfg, run_embedding_set),
+        daemon=True,
+    )
+    t.start()
+    return dict(task)
+
+
+@app.delete("/playground_api/embeddings/{name}")
+def delete_embedding(name: str) -> dict:
+    """Remove the named embedding set's metadata + membership. The
+    underlying vectors in `semantic_embedding` are left intact — other sets
+    or the pipeline may still reference them."""
+    return delete_embedding_set(name)
+
+
+# ============================================================
+# Combined Reports Project — snapshots isFinalCanonical=true reports from
+# GO, GI, and INSIGHT into a single virtual project for cross-project
+# rationalization.
+# ============================================================
+
+@app.get("/playground_api/combined/status")
+def combined_reports_status() -> dict:
+    """Freshness info for the Combined Reports overview banner — when each
+    source was last snapshotted and whether any have drifted since."""
+    return combined_status()
+
+
+class CombinedBuildConfig(BaseModel):
+    run_pipeline: bool = True
+    emit: bool = True
+
+
+@app.post("/playground_api/combined/rebuild")
+def combined_reports_rebuild(cfg: CombinedBuildConfig | None = None) -> dict:
+    """Async rebuild of combined-reports. Copies final-kept reports from
+    GO/GI/INSIGHT, re-runs the Rationalization pipeline, re-emits JSON."""
+    body = (cfg or CombinedBuildConfig()).model_dump()
+    task_id = f"task-{uuid.uuid4().hex[:12]}"
+    task = {
+        "id": task_id,
+        "status": "running",
+        "name": "Combined Reports · rebuild",
+        "expId": None,
+        "config": body,
+        "mode": "combined_rebuild",
+        "startedAt": datetime.now(timezone.utc).isoformat(),
+        "endedAt": None,
+        "error": None,
+    }
+    with _TASKS_LOCK:
+        _TASKS[task_id] = task
+        _save_tasks()
+    t = threading.Thread(
+        target=_run_in_background,
+        args=(task_id, body, build_combined_reports),
+        daemon=True,
+    )
+    t.start()
+    return dict(task)
+
+
 class DensityClusterConfig(BaseModel):
     id: str | None = None
     name: str | None = None
@@ -235,6 +368,8 @@ class DensityClusterConfig(BaseModel):
     clusterSelection: str = DENSITY_DEFAULTS["hdbscan_cluster_selection_method"]
     limit: int | None = None
     fields: dict[str, Any] | None = None
+    # Phase 2: reference a saved embedding set by name to reuse cached vectors
+    embeddingSetName: str | None = None
 
 
 @app.get("/playground_api/density/defaults")
@@ -291,6 +426,50 @@ class DomainClassifyConfig(BaseModel):
 def default_taxonomy() -> dict:
     """Return the fixed domain list the UI should show by default."""
     return {"domains": DEFAULT_DOMAINS}
+
+
+@app.get("/playground_api/domains/results/{project}")
+def get_domain_results(project: str) -> dict:
+    """Return classified reports for this project, grouped by domain.
+    Used by the "Classify Domain" tab to render the domain breakdown."""
+    from db.db import connect as _connect
+    short = _resolve_short_project(project)
+    conn = _connect()
+    try:
+        # Latest classification per report (in case the same report was
+        # reclassified — join gives us the most recent row).
+        rows = conn.execute(
+            """SELECT rd.report_id, r.name, rd.domain, rd.confidence,
+                      rd.classified_at, t.total_executions
+                 FROM report_domain rd
+                 LEFT JOIN report r
+                   ON r.project_id = rd.project_id AND r.report_id = rd.report_id
+                 LEFT JOIN raw_telemetry t
+                   ON t.project_id = rd.project_id AND t.report_id = rd.report_id
+                WHERE rd.project_id = ?
+                ORDER BY rd.domain, COALESCE(t.total_executions, 0) DESC""",
+            (short,),
+        ).fetchall()
+
+        by_domain: dict[str, list[dict]] = {}
+        for rid, name, domain, conf, ts, execs in rows:
+            by_domain.setdefault(domain or "Unclassified", []).append({
+                "id": rid,
+                "name": name or "",
+                "confidence": conf,
+                "classifiedAt": ts,
+                "executions": execs or 0,
+            })
+
+        last_run = max((ts for _, _, _, _, ts, _ in rows), default=None)
+        return {
+            "projectId": short,
+            "totalClassified": len(rows),
+            "byDomain": by_domain,
+            "lastRunAt": last_run,
+        }
+    finally:
+        conn.close()
 
 
 @app.post("/playground_api/domains/run")
@@ -362,9 +541,11 @@ PROJECT_NAME_MAP = {
     "global-operational": "Global Operational",
     "global-insight": "Global Insight",
     "insight": "INSIGHT",
+    "combined-reports": "Combined Reports Project",
     "Global Operational": "Global Operational",
     "Global Insight": "Global Insight",
     "INSIGHT": "INSIGHT",
+    "Combined Reports Project": "Combined Reports Project",
     "E77B77894C04BF0E6D244F9363CFAF64": "Global Operational",
     "07E2CE9311EB6800B59F0080EF050FB2": "Global Insight",
     "6104D29041297D66C6BD16B602F2705F": "INSIGHT",
@@ -685,21 +866,210 @@ def clear_active(project: str) -> dict:
     return {"project": short, "cleared": existed is not None, "previousExpId": existed}
 
 
+# ============================================================
+# User-retained reports — manual overrides that flow into the
+# "Final Reports to Keep" set even when semantic clustering doesn't
+# surface them as primaries/singletons.
+# ============================================================
+
+_RETAIN_SCHEMA = """
+CREATE TABLE IF NOT EXISTS user_retained_report (
+    project_id   TEXT NOT NULL,
+    report_id    TEXT NOT NULL,
+    retained_at  TEXT NOT NULL,
+    note         TEXT,
+    PRIMARY KEY (project_id, report_id)
+);
+
+-- Symmetric: explicit "retire" overrides. A report is in AT MOST one of
+-- these tables — toggling to the opposite state removes the original row.
+CREATE TABLE IF NOT EXISTS user_retired_report (
+    project_id   TEXT NOT NULL,
+    report_id    TEXT NOT NULL,
+    retired_at   TEXT NOT NULL,
+    note         TEXT,
+    PRIMARY KEY (project_id, report_id)
+);
+"""
+
+
+def _ensure_retain_schema(conn) -> None:
+    with conn:
+        conn.executescript(_RETAIN_SCHEMA)
+
+
+@app.get("/playground_api/retained/{project}")
+def list_retained(project: str) -> dict:
+    """Report IDs this project's reviewer has explicitly retained."""
+    from db.db import connect as _c
+    short = _resolve_short_project(project)
+    conn = _c()
+    try:
+        _ensure_retain_schema(conn)
+        rows = conn.execute(
+            """SELECT report_id, retained_at, note
+                 FROM user_retained_report
+                WHERE project_id = ?
+                ORDER BY retained_at DESC""",
+            (short,),
+        ).fetchall()
+        return {
+            "projectId": short,
+            "retained": [
+                {"id": r[0], "retainedAt": r[1], "note": r[2]} for r in rows
+            ],
+        }
+    finally:
+        conn.close()
+
+
+class RetainBody(BaseModel):
+    reportId: str
+    retained: bool = True
+    note: str | None = None
+
+
+@app.post("/playground_api/retained/{project}")
+def toggle_retained(project: str, body: RetainBody) -> dict:
+    """Mark a report retained (retained=true) or un-retain it (false).
+    Toggling retained ON removes any existing 'retired' override for the
+    same report, so the two sets stay mutually exclusive."""
+    from db.db import connect as _c
+    from datetime import datetime, timezone
+    short = _resolve_short_project(project)
+    conn = _c()
+    try:
+        _ensure_retain_schema(conn)
+        if body.retained:
+            with conn:
+                conn.execute(
+                    "DELETE FROM user_retired_report WHERE project_id=? AND report_id=?",
+                    (short, body.reportId),
+                )
+                conn.execute(
+                    """INSERT OR REPLACE INTO user_retained_report
+                        (project_id, report_id, retained_at, note)
+                        VALUES (?, ?, ?, ?)""",
+                    (short, body.reportId,
+                     datetime.now(timezone.utc).isoformat(), body.note),
+                )
+        else:
+            with conn:
+                conn.execute(
+                    "DELETE FROM user_retained_report WHERE project_id=? AND report_id=?",
+                    (short, body.reportId),
+                )
+        return {"projectId": short, "reportId": body.reportId, "retained": body.retained}
+    finally:
+        conn.close()
+
+
+# ----- Retired (explicit removal overrides) — mirror of retained -----
+
+@app.get("/playground_api/retired_overrides/{project}")
+def list_retired_overrides(project: str) -> dict:
+    """Report IDs this project's reviewer has explicitly marked for retirement,
+    overriding the semantic-clustering verdict."""
+    from db.db import connect as _c
+    short = _resolve_short_project(project)
+    conn = _c()
+    try:
+        _ensure_retain_schema(conn)
+        rows = conn.execute(
+            """SELECT report_id, retired_at, note
+                 FROM user_retired_report
+                WHERE project_id = ?
+                ORDER BY retired_at DESC""",
+            (short,),
+        ).fetchall()
+        return {
+            "projectId": short,
+            "retired": [
+                {"id": r[0], "retiredAt": r[1], "note": r[2]} for r in rows
+            ],
+        }
+    finally:
+        conn.close()
+
+
+class RetireBody(BaseModel):
+    reportId: str
+    retired: bool = True
+    note: str | None = None
+
+
+@app.post("/playground_api/retired_overrides/{project}")
+def toggle_retired(project: str, body: RetireBody) -> dict:
+    """Mark a report retired (retired=true) or clear the override (false).
+    Toggling retired ON removes any existing 'retained' override for the
+    same report."""
+    from db.db import connect as _c
+    from datetime import datetime, timezone
+    short = _resolve_short_project(project)
+    conn = _c()
+    try:
+        _ensure_retain_schema(conn)
+        if body.retired:
+            with conn:
+                conn.execute(
+                    "DELETE FROM user_retained_report WHERE project_id=? AND report_id=?",
+                    (short, body.reportId),
+                )
+                conn.execute(
+                    """INSERT OR REPLACE INTO user_retired_report
+                        (project_id, report_id, retired_at, note)
+                        VALUES (?, ?, ?, ?)""",
+                    (short, body.reportId,
+                     datetime.now(timezone.utc).isoformat(), body.note),
+                )
+        else:
+            with conn:
+                conn.execute(
+                    "DELETE FROM user_retired_report WHERE project_id=? AND report_id=?",
+                    (short, body.reportId),
+                )
+        return {"projectId": short, "reportId": body.reportId, "retired": body.retired}
+    finally:
+        conn.close()
+
+
 def _transform_to_semantic_clusters(exp: dict, project_id: str) -> list[dict]:
     """Translate an experiment result into the SemanticCluster[] shape the UI
-    expects. Missing per-member cosineToPrimary is None (we don't store it per
-    member in experiments). Executions/users come from telemetry_match."""
+    expects. Per-member `cosineToPrimary` is computed on-the-fly from the
+    semantic_embedding table (experiments don't persist per-member cosines,
+    only cluster-level avg/min). Executions/users come from telemetry_match."""
+    import numpy as np
     from db.db import connect
 
     scatter = (exp.get("viz") or {}).get("scatter") or []
     names_by_rid = {p["id"]: p.get("name") or "" for p in scatter}
     execs_by_rid = {p["id"]: p.get("executions") or 0 for p in scatter}
 
-    # Enrich with user counts from telemetry_match (not in the experiment).
+    cfg = exp.get("config") or {}
+    model = cfg.get("model", "text-embedding-3-large")
+    dim = int(cfg.get("dimensions") or 3072)
+
+    # Pull every embedding for this project+model+dim in one query, then
+    # index by report_id. Fast: one row per report regardless of cluster count.
+    vectors_by_rid: dict[str, np.ndarray] = {}
     users_by_rid: dict[str, int] = {}
     try:
         conn = connect()
         try:
+            # Vectors for cosine-to-primary computation.
+            for rid, blob in conn.execute(
+                """SELECT report_id, vector FROM semantic_embedding
+                    WHERE project_id=? AND model=? AND dimensions=?""",
+                (project_id, model, dim),
+            ):
+                try:
+                    v = np.frombuffer(blob, dtype=np.float32)
+                    if v.size == dim:
+                        vectors_by_rid[rid] = v
+                except Exception:
+                    pass
+
+            # User counts from telemetry_match.
             cols = {r[1] for r in conn.execute("PRAGMA table_info(telemetry_match)")}
             user_col = next(
                 (c for c in ("total_users", "unique_users", "users_count") if c in cols),
@@ -714,27 +1084,62 @@ def _transform_to_semantic_clusters(exp: dict, project_id: str) -> list[dict]:
         finally:
             conn.close()
     except Exception as e:
-        print(f"[transform] user-count query failed (non-fatal): {e}")
+        print(f"[transform] DB query failed (non-fatal): {e}")
+
+    def _cosine(a: "np.ndarray | None", b: "np.ndarray | None") -> "float | None":
+        if a is None or b is None:
+            return None
+        # Vectors stored via the embedding pipeline are normalized, but
+        # defensively renormalize to handle legacy rows.
+        na = float(np.linalg.norm(a))
+        nb = float(np.linalg.norm(b))
+        if na == 0 or nb == 0:
+            return None
+        return round(float(np.dot(a, b) / (na * nb)), 4)
 
     out: list[dict] = []
     for c in exp.get("clusters", []):
         members = c.get("memberIds", [])
+        primary_rid = c["primaryReportId"]
+        primary_vec = vectors_by_rid.get(primary_rid)
         total_users = sum(users_by_rid.get(m, 0) for m in members)
         total_execs = c.get("totalExecutions") or sum(execs_by_rid.get(m, 0) for m in members)
-        out.append({
+        row: dict = {
             "id": c["id"],
             "size": c["size"],
-            "primaryReportId": c["primaryReportId"],
-            "primaryName": c.get("primaryName") or names_by_rid.get(c["primaryReportId"], ""),
+            "primaryReportId": primary_rid,
+            "primaryName": c.get("primaryName") or names_by_rid.get(primary_rid, ""),
             "totalExecutions": total_execs,
             "totalUsers": total_users,
             "avgCosine": c.get("avgCosine"),
             "minCosine": c.get("minCosine"),
-            "members": [{"id": m, "cosineToPrimary": None} for m in members],
+            "members": [
+                {"id": m, "cosineToPrimary": 1.0 if m == primary_rid
+                 else _cosine(vectors_by_rid.get(m), primary_vec)}
+                for m in members
+            ],
             "memberIds": members,
             "isSingletons": False,
             "dataQuality": "unknown",
-        })
+        }
+        # Pass through the LLM review payload if the experiment has been
+        # reviewed. Skip errored ones so they don't drive the UI's "reviewed"
+        # count up falsely.
+        llm = c.get("llm")
+        if isinstance(llm, dict) and not llm.get("error") and llm.get("label"):
+            row["llm"] = {
+                "label": llm.get("label", ""),
+                "businessFunction": llm.get("businessFunction", ""),
+                "relationship": llm.get("relationship", ""),
+                "action": llm.get("action", ""),
+                "confidence": llm.get("confidence", ""),
+                "detail": llm.get("detail", ""),
+                "keepReport": llm.get("keepReport", ""),
+                "removableCount": int(llm.get("removableCount") or 0),
+                "removableIds": list(llm.get("removableIds") or []),
+                "error": None,
+            }
+        out.append(row)
 
     # One synthetic "singletons" bucket — reports outside any multi cluster.
     singleton_ids = [p["id"] for p in scatter if not p.get("clusterId")]
@@ -769,6 +1174,66 @@ def get_active_semantic_clusters(project: str) -> list[dict]:
         raise HTTPException(status_code=404, detail=f"experiment {exp_id} file missing")
     exp = json.loads(path.read_text(encoding="utf-8"))
     return _transform_to_semantic_clusters(exp, short)
+
+
+# ============================================================
+# LLM review of an experiment's clusters. Writes llm payloads back onto
+# each cluster in the experiment JSON, cached per-cluster by content hash.
+# ============================================================
+
+class LlmReviewRequest(BaseModel):
+    project: str
+    model: str | None = None
+
+
+def _wrap_llm_review(exp_id: str, cfg: dict) -> dict:
+    """Adapter: run_experiment_llm_review takes a config dict with `id`.
+    Our task runner passes the config through — add the exp_id on the way."""
+    return run_experiment_llm_review({**cfg, "id": exp_id}, verbose=True)
+
+
+@app.post("/playground_api/exp/{exp_id}/llm_review")
+def run_exp_llm_review(exp_id: str, body: LlmReviewRequest) -> dict:
+    """Kick off an LLM-review pass over every multi-member cluster in the
+    given experiment. Same async task pattern as /run — poll
+    /playground_api/task/{id} until status != running. Cached per cluster
+    so re-running an already-reviewed experiment is a near-instant no-op."""
+    if not os.environ.get("OPENAI_API_KEY"):
+        raise HTTPException(
+            status_code=500,
+            detail="OPENAI_API_KEY not set on the server. Add it to .env.local.",
+        )
+    exp_path = PLAYGROUND_DIR / f"{exp_id}.json"
+    if not exp_path.exists():
+        raise HTTPException(status_code=404, detail=f"experiment {exp_id} not found")
+
+    cfg = body.model_dump()
+    task_id = f"task-{uuid.uuid4().hex[:12]}"
+    task = {
+        "id": task_id,
+        "status": "running",
+        "name": f"LLM review · {exp_id}",
+        "expId": exp_id,
+        "config": cfg,
+        "mode": "llm_review",
+        "startedAt": datetime.now(timezone.utc).isoformat(),
+        "endedAt": None,
+        "error": None,
+    }
+    with _TASKS_LOCK:
+        _TASKS[task_id] = task
+        _save_tasks()
+
+    def _runner(_cfg: dict, verbose: bool = True) -> dict:
+        return _wrap_llm_review(exp_id, _cfg)
+
+    t = threading.Thread(
+        target=_run_in_background,
+        args=(task_id, cfg, _runner),
+        daemon=True,
+    )
+    t.start()
+    return dict(task)
 
 
 @app.delete("/playground_api/exp/{exp_id}")

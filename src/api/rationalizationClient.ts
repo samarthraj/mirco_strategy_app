@@ -110,6 +110,8 @@ export interface SemanticClusterLlm {
   detail: string;
   keepReport: string;
   removableCount: number;
+  /** IDs GPT explicitly marked removable, from the visible-members prompt window (up to 25). */
+  removableIds?: string[];
   error?: string | null;
 }
 
@@ -166,6 +168,10 @@ export interface ReportDetail {
   /** If this report is a family canonical, the collapsed siblings it stands
    *  for. Empty otherwise. */
   familySiblings?: FamilyCollapsedSibling[];
+  /** For reports copied into the Combined Reports Project, the source
+   *  project id (global-operational / global-insight / insight). Null for
+   *  regular project rows. Drives the [GO]/[GI]/[IN] origin pill in the UI. */
+  sourceProjectId?: string | null;
 }
 
 export interface FamilyCollapsedSibling {
@@ -281,6 +287,13 @@ export async function fetchClusters(projectName: string): Promise<ClusterMeta[]>
   return res.json();
 }
 
+export interface LlmReviewSummary {
+  reviewed: number;
+  removable: number;
+  safeToAuto: number;
+  byAction: Record<string, number>;
+}
+
 export interface PlaygroundExperimentIndexEntry {
   id: string;
   name: string;
@@ -303,6 +316,8 @@ export interface PlaygroundExperimentIndexEntry {
     minClusterSize: number;
     fields: Record<string, boolean | number>;
   };
+  llmReviewedAt?: string;
+  llmReviewSummary?: LlmReviewSummary;
 }
 
 export interface PlaygroundVizPoint {
@@ -406,6 +421,98 @@ export async function runDomainClassification(config: Record<string, unknown>): 
   return res.json();
 }
 
+export interface DomainClassifiedReport {
+  id: string;
+  name: string;
+  confidence: number | null;
+  classifiedAt: string | null;
+  executions: number;
+}
+
+export interface DomainResults {
+  projectId: string;
+  totalClassified: number;
+  byDomain: Record<string, DomainClassifiedReport[]>;
+  lastRunAt: string | null;
+}
+
+export async function fetchDomainResults(project: string): Promise<DomainResults> {
+  const res = await fetch(`/playground_api/domains/results/${encodeURIComponent(project)}`);
+  if (!res.ok) {
+    if (res.status === 404) {
+      return { projectId: project, totalClassified: 0, byDomain: {}, lastRunAt: null };
+    }
+    await _unwrapError(res);
+  }
+  return res.json();
+}
+
+// ============================================================
+// User-retained reports — manual retention overrides that flow
+// into the "Final Reports to Keep" set.
+// ============================================================
+
+export interface RetainedReport {
+  id: string;
+  retainedAt: string;
+  note: string | null;
+}
+
+export async function fetchRetainedReports(project: string): Promise<Set<string>> {
+  try {
+    const res = await fetch(`/playground_api/retained/${encodeURIComponent(project)}`);
+    if (!res.ok) return new Set();
+    const data: { retained: RetainedReport[] } = await res.json();
+    return new Set(data.retained.map((r) => r.id));
+  } catch {
+    return new Set();
+  }
+}
+
+export async function toggleReportRetained(
+  project: string, reportId: string, retained: boolean, note?: string,
+): Promise<boolean> {
+  try {
+    const res = await fetch(`/playground_api/retained/${encodeURIComponent(project)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reportId, retained, note }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// Mirror of retained, for explicit "retire" overrides (user says "drop this
+// even though the LLM/cluster kept it"). The two sets are mutually exclusive
+// server-side: toggling one clears the other.
+export async function fetchRetiredOverrides(project: string): Promise<Set<string>> {
+  try {
+    const res = await fetch(`/playground_api/retired_overrides/${encodeURIComponent(project)}`);
+    if (!res.ok) return new Set();
+    const data: { retired: { id: string }[] } = await res.json();
+    return new Set((data.retired || []).map((r) => r.id));
+  } catch {
+    return new Set();
+  }
+}
+
+export async function toggleReportRetired(
+  project: string, reportId: string, retired: boolean, note?: string,
+): Promise<boolean> {
+  try {
+    const res = await fetch(`/playground_api/retired_overrides/${encodeURIComponent(project)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reportId, retired, note }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 export interface DensityDefaults {
   umap_n_neighbors: number;
   umap_min_dist: number;
@@ -426,6 +533,146 @@ export async function runDensityClustering(config: Record<string, unknown>): Pro
   return res.json();
 }
 
+// ============================================================
+// Named embedding sets — the "asset layer" that clustering builds on.
+// Create once, reuse across Semantic / Density / any future clusterer.
+// ============================================================
+
+export interface EmbeddingSet {
+  name: string;
+  projectId: string;
+  scope: string;
+  sourceFilter: string;
+  model: string;
+  dim: number;
+  fields: Record<string, boolean | number>;
+  reportCount: number;
+  tokenEstimate: number | null;
+  createdAt: string;
+  refreshedAt: string | null;
+}
+
+export interface EmbeddingSetPreview {
+  totalReports: number;
+  cached: number;
+  new: number;
+  tokenEstimate: number;
+  estimatedCostUsd: number;
+  model: string;
+  projectId: string;
+}
+
+export interface EmbeddingSetConfig {
+  name: string;
+  project: string;
+  scope: string;
+  sourceFilter: string;
+  domainFilter?: string | null;  // "all"/null = no filter, else an exact domain name
+  model: string;
+  dimensions: number;
+  fields: Record<string, boolean | number>;
+  limit?: number | null;
+}
+
+export async function fetchEmbeddingSets(project?: string): Promise<EmbeddingSet[]> {
+  try {
+    const q = project ? `?project=${encodeURIComponent(project)}` : "";
+    const res = await fetch(`/playground_api/embeddings${q}`);
+    if (!res.ok) return [];
+    return res.json();
+  } catch {
+    return [];
+  }
+}
+
+export async function previewEmbeddingSet(config: EmbeddingSetConfig): Promise<EmbeddingSetPreview | null> {
+  try {
+    const res = await fetch("/playground_api/embeddings/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(config),
+    });
+    if (!res.ok) return null;
+    return res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function runEmbeddingSet(config: EmbeddingSetConfig): Promise<PlaygroundTask> {
+  // Hard timeout so a silent hang surfaces as a clear error in the run log
+  // instead of sitting forever behind the button.
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 15000);
+  try {
+    const res = await fetch("/playground_api/embeddings/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(config),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) await _unwrapError(res);
+    return res.json();
+  } catch (e) {
+    if (e instanceof Error && e.name === "AbortError") {
+      throw new Error(
+        "fetch timed out after 15s — Vite proxy to /playground_api/ isn't reaching the sidecar. " +
+        "Hard-refresh the tab (Ctrl+Shift+R); if it still hangs, check the browser Network tab."
+      );
+    }
+    throw e;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+export async function deleteEmbeddingSet(name: string): Promise<void> {
+  await fetch(`/playground_api/embeddings/${encodeURIComponent(name)}`, { method: "DELETE" });
+}
+
+// ============================================================
+// Combined Reports Project — virtual project uniting final-kept reports
+// from GO, GI, INSIGHT. Rebuilt on demand.
+// ============================================================
+
+export interface CombinedSourceStatus {
+  sourceProjectId: string;
+  sourceName: string;
+  builtAt: string | null;
+  reportCount: number;
+  stale: boolean;
+  reason: string | null;
+  currentCount: number;
+}
+
+export interface CombinedStatus {
+  projectId: string;
+  totalReports: number;
+  lastBuiltAt: string | null;
+  stale: boolean;
+  sources: CombinedSourceStatus[];
+}
+
+export async function fetchCombinedStatus(): Promise<CombinedStatus | null> {
+  try {
+    const res = await fetch("/playground_api/combined/status");
+    if (!res.ok) return null;
+    return res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function rebuildCombinedReports(): Promise<PlaygroundTask> {
+  const res = await fetch("/playground_api/combined/rebuild", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ run_pipeline: true, emit: true }),
+  });
+  if (!res.ok) await _unwrapError(res);
+  return res.json();
+}
+
 export async function fetchDensityDefaults(): Promise<DensityDefaults | null> {
   try {
     const res = await fetch("/playground_api/density/defaults");
@@ -434,6 +681,22 @@ export async function fetchDensityDefaults(): Promise<DensityDefaults | null> {
   } catch {
     return null;
   }
+}
+
+/** Kick off an async LLM review of every multi-member cluster in an
+ *  experiment. Same task contract as the other runners — poll
+ *  fetchPlaygroundTask(id) until status != 'running'. */
+export async function runExperimentLlmReview(
+  expId: string,
+  project: string,
+): Promise<PlaygroundTask> {
+  const res = await fetch(`/playground_api/exp/${encodeURIComponent(expId)}/llm_review`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ project }),
+  });
+  if (!res.ok) await _unwrapError(res);
+  return res.json();
 }
 
 /** Default fixed taxonomy exposed by the sidecar. */

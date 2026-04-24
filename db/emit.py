@@ -29,6 +29,84 @@ def _json_dump(path: Path, obj) -> None:
     path.write_text(json.dumps(obj, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
 
 
+_PLAYGROUND_DIR = Path(__file__).resolve().parent.parent / "data" / "_playground"
+
+
+def _active_experiment_final_kept(project_id: str, conn: sqlite3.Connection | None = None) -> set[str] | None:
+    """Return primaries ∪ singletons from the active Playground semantic
+    experiment for this project, or None if no experiment is active. Used
+    to define `isFinalCanonical` so the UI's "Final Reports to Keep" tab
+    reflects the semantic clustering the user promoted, not the pipeline's
+    Jaccard similarity_cluster output.
+
+    `singletonIds` in the experiment JSON is capped at 500 entries (see
+    playground.py) so we derive the full singleton set as: all active
+    reports in scope minus every cluster member. Needs a DB conn for this."""
+    active_path = _PLAYGROUND_DIR / "active.json"
+    if not active_path.exists():
+        return None
+    try:
+        active = json.loads(active_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    exp_id = active.get(project_id)
+    if not exp_id:
+        return None
+    exp_path = _PLAYGROUND_DIR / f"{exp_id}.json"
+    if not exp_path.exists():
+        return None
+    try:
+        exp = json.loads(exp_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    clusters = exp.get("clusters") or []
+    primaries = {c.get("primaryReportId") for c in clusters if c.get("primaryReportId")}
+    all_cluster_members: set[str] = set()
+    for c in clusters:
+        for m in c.get("memberIds") or []:
+            all_cluster_members.add(m)
+
+    # Singletons = experiment scope minus cluster members. The scope stored
+    # on the experiment's config tells us exactly which reports were fed in.
+    scope_ids: set[str] | None = None
+    if conn is not None:
+        try:
+            from db.compute.playground import _resolve_scope, _apply_source_filter
+            cfg = exp.get("config") or {}
+            scope = cfg.get("scope", "active")
+            src_filter = cfg.get("sourceFilter", "all")
+            rids = _resolve_scope(conn, project_id, scope)
+            rids = _apply_source_filter(conn, project_id, rids, src_filter)
+            scope_ids = rids
+        except Exception:
+            scope_ids = None
+
+    if scope_ids is not None:
+        singletons = scope_ids - all_cluster_members
+    else:
+        # Fallback — use the capped list in the JSON (may miss some)
+        singletons = set(exp.get("singletonIds") or [])
+
+    # Also include user-retained reports (manual overrides). These show up
+    # in the "Final Reports to Keep" tab even when semantic clustering
+    # didn't surface them as primaries/singletons.
+    user_retained: set[str] = set()
+    if conn is not None:
+        try:
+            user_retained = {
+                r[0] for r in conn.execute(
+                    "SELECT report_id FROM user_retained_report WHERE project_id=?",
+                    (project_id,),
+                )
+            }
+        except sqlite3.OperationalError:
+            # Table may not exist yet if Retain was never used on this DB.
+            pass
+
+    return primaries | singletons | user_retained
+
+
 # ---------------- summary.json ------------------------------------
 
 def emit_summary(pid: str, conn: sqlite3.Connection) -> dict:
@@ -176,7 +254,12 @@ def emit_summary(pid: str, conn: sqlite3.Connection) -> dict:
     out["topFilters"] = tl("filter")
     out["topExecuted"] = tl("executed")
 
-    # LLM action histogram
+    # LLM action histogram + totals. The pipeline's run_summary INSERT never
+    # writes llm_reviews_total / llm_safe_clusters / llm_removable_raw, so
+    # derive them here from llm_action_count + llm_review. "safe" =
+    # actions that don't need human re-review: MERGE_IMMEDIATE and
+    # PARAMETERIZE are safely automatable; REVIEW_WITH_OWNER / KEEP_SEPARATE
+    # / UNKNOWN require a human.
     lac = {
         r["action"]: r["count"]
         for r in conn.execute(
@@ -185,6 +268,17 @@ def emit_summary(pid: str, conn: sqlite3.Connection) -> dict:
     }
     if lac:
         out["llmReviewsByAction"] = lac
+        total = sum(lac.values())
+        safe_actions = {"MERGE_IMMEDIATE", "PARAMETERIZE"}
+        safe = sum(n for a, n in lac.items() if a in safe_actions)
+        out["llmReviewsTotal"] = total
+        out["llmSafeClusters"] = safe
+        # Total rows flagged as "removable" across all Jaccard-side reviews.
+        removable = conn.execute(
+            "SELECT COALESCE(SUM(removable_count), 0) FROM llm_review WHERE project_id = ?",
+            (pid,),
+        ).fetchone()[0]
+        out["llmRemovableRaw"] = int(removable or 0)
 
     # alternativeFamilyMethod — small dict the Overview tab reads
     if row["alt_family_label"] or row["alt_family_value"] is not None:
@@ -265,25 +359,31 @@ def emit_reports(pid: str, conn: sqlite3.Connection, scope: str = "all") -> list
     for lst in family_siblings_by_canonical.values():
         lst.sort(key=lambda x: (-x["executions"], x["name"]))
 
-    # Final canonicals = primaries of multi-member similarity clusters + post-AST singletons
-    cluster_primaries: set[str] = set()
-    for row in conn.execute(
-        "SELECT primary_report_id FROM similarity_cluster WHERE project_id = ?", (pid,)
-    ):
-        if row[0]:
-            cluster_primaries.add(row[0])
-    similarity_members: set[str] = set()
-    for row in conn.execute(
-        "SELECT report_id FROM similarity_cluster_member WHERE project_id = ?", (pid,)
-    ):
-        similarity_members.add(row[0])
-    try:
-        from db.compute.pipeline import _post_ast_family_canonical_ids
-        post_family = _post_ast_family_canonical_ids(conn, pid)
-    except Exception:
-        post_family = set()
-    post_family_singletons = post_family - similarity_members
-    final_kept = cluster_primaries | post_family_singletons
+    # Final canonicals — prefer the active Playground experiment's semantic
+    # clusters (primaries + singletons = stats.finalUnique) when one is
+    # configured; this matches what users see in the Semantic Clusters tab.
+    # Falls back to the Jaccard pipeline's similarity_cluster primaries +
+    # post-AST singletons when no experiment is active.
+    final_kept: set[str] | None = _active_experiment_final_kept(pid, conn)
+    if final_kept is None:
+        cluster_primaries: set[str] = set()
+        for row in conn.execute(
+            "SELECT primary_report_id FROM similarity_cluster WHERE project_id = ?", (pid,)
+        ):
+            if row[0]:
+                cluster_primaries.add(row[0])
+        similarity_members: set[str] = set()
+        for row in conn.execute(
+            "SELECT report_id FROM similarity_cluster_member WHERE project_id = ?", (pid,)
+        ):
+            similarity_members.add(row[0])
+        try:
+            from db.compute.pipeline import _post_ast_family_canonical_ids
+            post_family = _post_ast_family_canonical_ids(conn, pid)
+        except Exception:
+            post_family = set()
+        post_family_singletons = post_family - similarity_members
+        final_kept = cluster_primaries | post_family_singletons
 
     out = []
     for r in reports:
@@ -321,6 +421,12 @@ def emit_reports(pid: str, conn: sqlite3.Connection, scope: str = "all") -> list
             # Collapsed family siblings that this canonical stands for. Empty
             # list when the report isn't a family canonical (or has no sibs).
             "familySiblings": family_siblings_by_canonical.get(rid, []),
+            # Set only in the Combined Reports Project — tags the source
+            # project (GO/GI/INSIGHT) a copied row originated from. Null for
+            # regular projects. The UI renders a [GO]/[GI]/[IN] pill.
+            "sourceProjectId": (
+                r["source_project_id"] if "source_project_id" in r.keys() else None
+            ),
         })
     return out
 
@@ -882,8 +988,17 @@ def emit_heavy_users(pid: str, conn: sqlite3.Connection, top_user_cap: int = 100
     """
     cfg = get_project(pid)
     proj_name = cfg["name"]
-    like1 = f"/{proj_name}/%"
-    like2 = f"{proj_name}/%"
+    # Virtual project: aggregate across the source projects' folder trees.
+    # Regular projects: match their own folder path prefix.
+    if pid == "combined-reports":
+        source_names = ["Global Operational", "Global Insight", "INSIGHT"]
+        path_patterns: list[str] = []
+        for n in source_names:
+            path_patterns.append(f"/{n}/%")
+            path_patterns.append(f"{n}/%")
+    else:
+        path_patterns = [f"/{proj_name}/%", f"{proj_name}/%"]
+    like_or = "(" + " OR ".join("folder_path LIKE ?" for _ in path_patterns) + ")"
 
     # Service-account heuristics — flagged separately in the UI
     SERVICE_MARKERS = ("ODS_PROD", "System Operation", "Administrator", "dataiku",
@@ -902,18 +1017,23 @@ def emit_heavy_users(pid: str, conn: sqlite3.Connection, top_user_cap: int = 100
     ]
     dev_admin_lower = [u.lower() for u in all_users if is_dev_admin(u)]
 
-    # Build the exclusion clause with placeholders; empty list → no exclusion.
+    # Dev/admin profile-folder exclusion — one LIKE pair per path prefix.
+    profile_patterns: list[str] = []
+    if pid == "combined-reports":
+        for n in ["Global Operational", "Global Insight", "INSIGHT"]:
+            profile_patterns.append(f"/{n}/Profiles/%")
+            profile_patterns.append(f"{n}/Profiles/%")
+    else:
+        profile_patterns = [f"/{proj_name}/Profiles/%", f"{proj_name}/Profiles/%"]
+    profile_or = "(" + " OR ".join("folder_path LIKE ?" for _ in profile_patterns) + ")"
+
     if dev_admin_lower:
         excl_placeholders = ",".join("?" * len(dev_admin_lower))
         excl_clause = (
-            "AND NOT ((folder_path LIKE ? OR folder_path LIKE ?) "
+            f"AND NOT ({profile_or} "
             f"AND lower(user) IN ({excl_placeholders}))"
         )
-        excl_params = [
-            f"/{proj_name}/Profiles/%",
-            f"{proj_name}/Profiles/%",
-            *dev_admin_lower,
-        ]
+        excl_params = [*profile_patterns, *dev_admin_lower]
     else:
         excl_clause = ""
         excl_params = []
@@ -926,13 +1046,13 @@ def emit_heavy_users(pid: str, conn: sqlite3.Connection, top_user_cap: int = 100
                    SUM(errors) AS errors,
                    MAX(last_execution) AS last_exec
               FROM raw_user_activity
-             WHERE (folder_path LIKE ? OR folder_path LIKE ?)
+             WHERE {like_or}
                AND user != ''
                {excl_clause}
              GROUP BY user
              ORDER BY execs DESC
              LIMIT ?""",
-        [like1, like2, *excl_params, top_user_cap],
+        [*path_patterns, *excl_params, top_user_cap],
     ).fetchall()
 
     # Lookup for report status + cluster
@@ -978,27 +1098,26 @@ def emit_heavy_users(pid: str, conn: sqlite3.Connection, top_user_cap: int = 100
         # personal-folder rows so only the public-folder activity is shown.
         if is_dev:
             top_reports = conn.execute(
-                """SELECT object_id, report_name, SUM(executions) e, SUM(sessions) s,
+                f"""SELECT object_id, report_name, SUM(executions) e, SUM(sessions) s,
                           SUM(errors) err, MAX(last_execution) le, folder_path
                      FROM raw_user_activity
                     WHERE user = ?
-                      AND (folder_path LIKE ? OR folder_path LIKE ?)
-                      AND NOT (folder_path LIKE ? OR folder_path LIKE ?)
+                      AND {like_or}
+                      AND NOT {profile_or}
                     GROUP BY object_id, report_name, folder_path
                     ORDER BY e DESC LIMIT 25""",
-                (user, like1, like2,
-                 f"/{proj_name}/Profiles/%", f"{proj_name}/Profiles/%"),
+                [user, *path_patterns, *profile_patterns],
             ).fetchall()
         else:
             top_reports = conn.execute(
-                """SELECT object_id, report_name, SUM(executions) e, SUM(sessions) s,
+                f"""SELECT object_id, report_name, SUM(executions) e, SUM(sessions) s,
                           SUM(errors) err, MAX(last_execution) le, folder_path
                      FROM raw_user_activity
                     WHERE user = ?
-                      AND (folder_path LIKE ? OR folder_path LIKE ?)
+                      AND {like_or}
                     GROUP BY object_id, report_name, folder_path
                     ORDER BY e DESC LIMIT 25""",
-                (user, like1, like2),
+                [user, *path_patterns],
             ).fetchall()
         report_list = []
         for tr in top_reports:

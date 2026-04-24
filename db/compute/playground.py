@@ -340,6 +340,12 @@ def _resolve_project_id(project_ref: str) -> str:
 
 
 def run_experiment(config: dict, verbose: bool = True) -> dict:
+    # Phase 2: if the user picked a saved embedding set, resolve its
+    # scope/sourceFilter/model/dim/fields into the config so this run
+    # hits the cache for all vectors.
+    from db.compute.embedding_set import resolve_config_from_set
+    config = resolve_config_from_set(config)
+
     exp_id = config.get("id") or f"exp-{int(time.time())}"
     name = config.get("name") or exp_id
     project_id = _resolve_project_id(config["project"])
@@ -353,6 +359,9 @@ def run_experiment(config: dict, verbose: bool = True) -> dict:
 
     cfg_name = get_project(project_id)["name"]
     print(f"\n=== Experiment {exp_id} ({name}) — project {cfg_name} ===")
+    resolved_es = config.get("_resolvedFromEmbeddingSet")
+    if resolved_es:
+        print(f"  [using embedding set '{resolved_es}']")
     print(f"  scope={scope} src={src_filter} model={model} dim={dim} thr={threshold}")
 
     init()
