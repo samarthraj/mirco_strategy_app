@@ -18,6 +18,7 @@ import {
   fetchRetainedReports, toggleReportRetained,
   fetchRetiredOverrides, toggleReportRetired,
   runDensityClustering, fetchDensityDefaults,
+  downloadRationalizationExport,
   runExperimentLlmReview,
   fetchEmbeddingSets, previewEmbeddingSet, runEmbeddingSet, deleteEmbeddingSet,
   fetchCombinedStatus, rebuildCombinedReports,
@@ -3751,6 +3752,28 @@ function ReportsTab({
   setMinExecs: (v: string) => void;
 }) {
   const [chatOpen, setChatOpen] = useState(false);
+  // Excel-export download state — the build takes ~10-30s on large projects;
+  // we disable the button + show progress so the user knows it's working.
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
+  const [exportInfo, setExportInfo] = useState<{ rows: number; cols: number; filename: string } | null>(null);
+  async function handleExport() {
+    if (exporting) return;
+    if (!projectName) { setExportError('No project selected'); return; }
+    const short = PROJECT_NAME_TO_SHORT[projectName];
+    if (!short) { setExportError(`Unknown project: ${projectName}`); return; }
+    setExporting(true);
+    setExportError(null);
+    setExportInfo(null);
+    try {
+      const info = await downloadRationalizationExport(short);
+      setExportInfo(info);
+    } catch (e: unknown) {
+      setExportError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setExporting(false);
+    }
+  }
   // Domain classification map — rid -> domain name. Fetched from the
   // Classify Domain run for this project; empty when nothing's been
   // classified, in which case grouping falls back to a single "All" bucket.
@@ -3823,18 +3846,53 @@ function ReportsTab({
             )})
           </span>
         </h2>
-        <button
-          onClick={() => setChatOpen((v) => !v)}
-          className={`flex items-center gap-2 text-sm font-semibold px-4 py-2 rounded-lg border transition-colors ${
-            chatOpen
-              ? 'bg-fuchsia-900/50 text-fuchsia-200 border-fuchsia-600'
-              : 'bg-fuchsia-600 hover:bg-fuchsia-500 text-white border-fuchsia-500'
-          }`}
-          title="Ask questions about this project's rationalization data"
-        >
-          🤖 {chatOpen ? 'Hide' : 'Ask'} AI Assistant
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={handleExport}
+            disabled={exporting}
+            className={`flex items-center gap-2 text-sm font-semibold px-4 py-2 rounded-lg border transition-colors ${
+              exporting
+                ? 'bg-emerald-900/40 text-emerald-300 border-emerald-700 cursor-wait'
+                : 'bg-emerald-600 hover:bg-emerald-500 text-white border-emerald-500'
+            }`}
+            title="Download an Excel passport showing every report's per-stage outcome, who survived it, LLM verdict, and final disposition. Builds on the sidecar (~10-30s)."
+          >
+            {exporting ? (
+              <>
+                <span className="inline-block w-3 h-3 border-2 border-emerald-400 border-t-transparent rounded-full animate-spin" />
+                Building xlsx…
+              </>
+            ) : (
+              <>📄 Download Excel</>
+            )}
+          </button>
+          <button
+            onClick={() => setChatOpen((v) => !v)}
+            className={`flex items-center gap-2 text-sm font-semibold px-4 py-2 rounded-lg border transition-colors ${
+              chatOpen
+                ? 'bg-fuchsia-900/50 text-fuchsia-200 border-fuchsia-600'
+                : 'bg-fuchsia-600 hover:bg-fuchsia-500 text-white border-fuchsia-500'
+            }`}
+            title="Ask questions about this project's rationalization data"
+          >
+            🤖 {chatOpen ? 'Hide' : 'Ask'} AI Assistant
+          </button>
+        </div>
       </div>
+      {(exportError || exportInfo) && (
+        <div className="mb-2 text-xs">
+          {exportError && (
+            <div className="text-red-300 bg-red-950/40 border border-red-800/50 rounded px-3 py-1.5">
+              Export failed: {exportError}
+            </div>
+          )}
+          {exportInfo && !exportError && (
+            <div className="text-emerald-300 bg-emerald-950/40 border border-emerald-800/50 rounded px-3 py-1.5">
+              ✓ Downloaded {exportInfo.filename} · {exportInfo.rows.toLocaleString()} rows × {exportInfo.cols} columns
+            </div>
+          )}
+        </div>
+      )}
       <p className="text-xs text-gray-500 mb-4">
         {scope === 'final'
           ? `Canonical set after every pipeline stage (${finalKeptCount.toLocaleString()} reports): similarity-cluster primaries + post-AST singletons. Click any row for details.`

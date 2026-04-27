@@ -436,6 +436,38 @@ export interface DomainResults {
   lastRunAt: string | null;
 }
 
+/**
+ * Stream the rationalization-passport xlsx for a project and trigger a
+ * browser download. Build time on the server is ~20s for a 50k-report
+ * project, so the caller should show a "preparing…" spinner while awaiting.
+ */
+export async function downloadRationalizationExport(project: string): Promise<{ rows: number; cols: number; filename: string }> {
+  const res = await fetch(`/playground_api/rationalization/export/${encodeURIComponent(project)}`);
+  if (!res.ok) {
+    let detail = "";
+    try { const e = await res.json(); detail = e?.detail ?? ""; } catch { /* ignore */ }
+    throw new Error(`Export failed (HTTP ${res.status})${detail ? ": " + detail : ""}`);
+  }
+  // Pull stats from response headers BEFORE consuming the body
+  const rows = parseInt(res.headers.get("X-Export-Rows") || "0", 10);
+  const cols = parseInt(res.headers.get("X-Export-Cols") || "0", 10);
+  // Filename — prefer Content-Disposition, fall back to a sensible default
+  const cd = res.headers.get("Content-Disposition") || "";
+  const m = cd.match(/filename="?([^";]+)"?/i);
+  const filename = m?.[1] || `${project}_rationalization.xlsx`;
+  // Trigger browser download via blob URL
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  return { rows, cols, filename };
+}
+
+
 export async function fetchDomainResults(project: string): Promise<DomainResults> {
   const res = await fetch(`/playground_api/domains/results/${encodeURIComponent(project)}`);
   if (!res.ok) {

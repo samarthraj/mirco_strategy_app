@@ -39,6 +39,7 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from db.compute.playground import run_experiment, PLAYGROUND_DIR
@@ -426,6 +427,31 @@ class DomainClassifyConfig(BaseModel):
 def default_taxonomy() -> dict:
     """Return the fixed domain list the UI should show by default."""
     return {"domains": DEFAULT_DOMAINS}
+
+
+@app.get("/playground_api/rationalization/export/{project}")
+def rationalization_export(project: str):
+    """Stream a per-report rationalization passport xlsx. ~20s build for a
+    ~50k-report project; the response is the binary xlsx with attachment
+    headers so the browser triggers a save dialog."""
+    from io import BytesIO
+    from export_rationalization_xlsx import build_xlsx_bytes
+    short = _resolve_short_project(project)
+    try:
+        data, stats = build_xlsx_bytes(short)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"export failed: {e}")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    filename = f"{short}_rationalization_{ts}.xlsx"
+    return StreamingResponse(
+        BytesIO(data),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Export-Rows": str(stats["rows"]),
+            "X-Export-Cols": str(stats["cols"]),
+        },
+    )
 
 
 @app.get("/playground_api/domains/results/{project}")
