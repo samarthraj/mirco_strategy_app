@@ -86,7 +86,7 @@ const TAB_LABELS: Record<TabKey, string> = {
   // comparison: 'Jaccard vs Semantic',
   // embeddings: 'Embeddings',
   // 'ai-playground': 'AI Playground',
-  // semantic: 'Semantic Clusters',
+  semantic: 'Semantic Clusters',
   // density: 'Density Clustering',
   'llm-review': 'LLM Review',
   reports: 'Final Reports to Keep',
