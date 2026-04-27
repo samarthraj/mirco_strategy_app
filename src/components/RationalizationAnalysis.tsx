@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import * as XLSX from 'xlsx';
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
   PieChart, Pie, Legend,
@@ -81,12 +82,12 @@ const TAB_LABELS: Record<TabKey, string> = {
   ast: 'AST',
   families: 'Families',
   clusters: 'Jaccard Clusters',
-  'classify-domain': 'Classify Domain',
-  comparison: 'Jaccard vs Semantic',
-  embeddings: 'Embeddings',
-  'ai-playground': 'AI Playground',
-  semantic: 'Semantic Clusters',
-  density: 'Density Clustering',
+  // 'classify-domain': 'Classify Domain',
+  // comparison: 'Jaccard vs Semantic',
+  // embeddings: 'Embeddings',
+  // 'ai-playground': 'AI Playground',
+  // semantic: 'Semantic Clusters',
+  // density: 'Density Clustering',
   'llm-review': 'LLM Review',
   reports: 'Final Reports to Keep',
   'heavy-users': 'Heavy Users',
@@ -3757,17 +3758,61 @@ function ReportsTab({
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
   const [exportInfo, setExportInfo] = useState<{ rows: number; cols: number; filename: string } | null>(null);
-  async function handleExport() {
+
+  // OLD: FastAPI-based export (commented out — requires playground_server.py on port 8899)
+  // async function handleExport() {
+  //   if (exporting) return;
+  //   if (!projectName) { setExportError('No project selected'); return; }
+  //   const short = PROJECT_NAME_TO_SHORT[projectName];
+  //   if (!short) { setExportError(`Unknown project: ${projectName}`); return; }
+  //   setExporting(true);
+  //   setExportError(null);
+  //   setExportInfo(null);
+  //   try {
+  //     const info = await downloadRationalizationExport(short);
+  //     setExportInfo(info);
+  //   } catch (e: unknown) {
+  //     setExportError(e instanceof Error ? e.message : String(e));
+  //   } finally {
+  //     setExporting(false);
+  //   }
+  // }
+
+  // NEW: Browser-based export — generates Excel directly from loaded data, no server needed
+  function handleExport() {
     if (exporting) return;
-    if (!projectName) { setExportError('No project selected'); return; }
-    const short = PROJECT_NAME_TO_SHORT[projectName];
-    if (!short) { setExportError(`Unknown project: ${projectName}`); return; }
     setExporting(true);
     setExportError(null);
     setExportInfo(null);
     try {
-      const info = await downloadRationalizationExport(short);
-      setExportInfo(info);
+      const toRow = (r: ReportDetail) => ({
+        'Report Name': r.name,
+        'Owner': r.owner,
+        'Path': r.path,
+        'Executions': r.executions,
+        'Users': r.users,
+        'Last Executed': r.lastExec,
+        'Source Type': r.sourceType ?? '',
+        'Metrics': r.metricCount,
+        'Tables': r.tableCount,
+        'Filters': r.filterCount,
+        'Cluster ID': r.clusterId ?? '',
+        'Match Tier': r.matchTier,
+        'Date Created': r.dateCreated ?? '',
+        'Date Modified': r.dateModified ?? '',
+      });
+
+      const finalKept = allReports.filter((r) => r.isFinalCanonical === true);
+      const ws1 = XLSX.utils.json_to_sheet(finalKept.map(toRow));
+      const ws2 = XLSX.utils.json_to_sheet(allReports.map(toRow));
+
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws1, 'Final-Kept');
+      XLSX.utils.book_append_sheet(wb, ws2, 'All Reports');
+
+      const filename = `${projectName ?? 'export'}_rationalization.xlsx`;
+      XLSX.writeFile(wb, filename);
+      setExportInfo({ rows: finalKept.length + allReports.length, cols: 14, filename });
     } catch (e: unknown) {
       setExportError(e instanceof Error ? e.message : String(e));
     } finally {
