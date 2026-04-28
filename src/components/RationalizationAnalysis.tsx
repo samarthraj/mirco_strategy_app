@@ -1224,6 +1224,7 @@ function CombinedRebuildBanner() {
           )}
         </div>
         <div className="flex flex-col gap-2 flex-shrink-0">
+          {/* Rebuild button hidden — restoring from original JSON bundle required
           <button onClick={handleRebuild} disabled={running}
             className={`text-sm font-semibold px-4 py-2 rounded ${
               running
@@ -1234,6 +1235,7 @@ function CombinedRebuildBanner() {
             }`}>
             {running ? `Rebuilding… (${elapsed}s)` : status.lastBuiltAt ? '↻ Rebuild now' : '▶ Build now'}
           </button>
+          */}
         </div>
       </div>
     </div>
@@ -3911,6 +3913,7 @@ function ReportsTab({
               <>📄 Download Excel</>
             )}
           </button>
+          {/* Ask AI Assistant button — hidden (requires FastAPI server on port 8899)
           <button
             onClick={() => setChatOpen((v) => !v)}
             className={`flex items-center gap-2 text-sm font-semibold px-4 py-2 rounded-lg border transition-colors ${
@@ -3922,6 +3925,7 @@ function ReportsTab({
           >
             🤖 {chatOpen ? 'Hide' : 'Ask'} AI Assistant
           </button>
+          */}
         </div>
       </div>
       {(exportError || exportInfo) && (
